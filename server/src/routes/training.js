@@ -33,10 +33,14 @@ const Q_INSERT_COURSE = sql({
          (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id, course_code, title`,
-  mssql: `INSERT INTO training_courses
+  // training_courses carries trg_training_courses_updated_at, so OUTPUT has to
+  // go INTO a table variable rather than straight to the caller.
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, course_code NVARCHAR(450), title NVARCHAR(450));
+       INSERT INTO training_courses
          (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
-       OUTPUT INSERTED.id, INSERTED.course_code, INSERTED.title
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+       OUTPUT INSERTED.id, INSERTED.course_code, INSERTED.title INTO @out
+       VALUES ($1,$2,$3,$4,$5,$6,$7);
+       SELECT id, course_code, title FROM @out;`,
 });
 
 // Flattens the skills column to a string array on both dialects: pg already has

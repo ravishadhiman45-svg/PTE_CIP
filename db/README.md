@@ -97,8 +97,11 @@ Not spelling differences — these needed a different design.
    reject every reparent. The correct test is the Postgres one, in the other
    direction: is the proposed **manager** inside the subtree of the row being
    changed? That reads the same before and after the write.
-   `AFTER` rather than `INSTEAD OF` is also deliberate — an `INSTEAD OF` trigger
-   on `employees` would break the `OUTPUT` clause the API relies on.
+   `AFTER` rather than `INSTEAD OF` is deliberate for a plainer reason: an
+   `INSTEAD OF` trigger must perform the write itself, so it would have to
+   re-implement the INSERT and UPDATE — including the defaults and the
+   `sibling_order` subquery — and stay in step with them forever. An `AFTER`
+   trigger only has to answer a yes/no question.
 
 3. **41 `ON DELETE CASCADE`s, two of which SQL Server refuses.** It rejects a
    schema where a table is reachable by more than one cascade path from the same
@@ -118,6 +121,59 @@ Not spelling differences — these needed a different design.
    ordering and `lib/visibility.js` orders explicitly — a better home for it
    anyway, since a function's internal `ORDER BY` never really guaranteed the
    result order.
+
+## Two restrictions that only bite at runtime
+
+Neither is visible in the DDL, in a schema check, or on any read path. Both were
+found by executing against a real instance.
+
+**1. `OUTPUT` without `INTO` is refused on a table with an enabled trigger.**
+
+> The target table ... cannot have any enabled triggers if the statement contains
+> an OUTPUT clause without INTO clause.
+
+`employees`, `employee_cv`, `skills`, `training_courses`, `job_roles` and
+`organizations` all carry triggers, so every `RETURNING` translated on those
+tables must capture into a table variable and select it back:
+
+```sql
+DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
+UPDATE employees SET photo_url = @p2
+  OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
+  WHERE id = @p1;
+SELECT id, photo_url FROM @out;
+```
+
+This affects only WRITE paths, so it survives any amount of read-only testing.
+Two assertions in `server/test/dualsql.test.js` guard it: that OUTPUT on a
+trigger-bearing table uses `INTO`, and that anything capturing into a table
+variable also selects back out of it.
+
+**2. `EXISTS` cannot be selected as a column.**
+
+Postgres treats `EXISTS (...)` as a boolean expression, so it can appear in a
+select list. T-SQL has no boolean expression type — `EXISTS` is only ever a
+predicate — so a projection needs
+`CAST(CASE WHEN EXISTS (...) THEN 1 ELSE 0 END AS bit)`. `EXISTS` inside a
+`WHERE` clause is portable and is deliberately not flagged.
+
+## Running the SQL files
+
+Use a client that treats `GO` as a batch separator. All three files set
+`ANSI_NULLS` and `QUOTED_IDENTIFIER` themselves rather than inheriting them,
+because **sqlcmd defaults `QUOTED_IDENTIFIER` to OFF while SSMS and Azure Data
+Studio default it ON** — and `uq_employees_single_root`, being a filtered index,
+requires both ON. Without the explicit `SET`, the schema loads in SSMS and fails
+under sqlcmd.
+
+The same applies to ad-hoc DML you run by hand: any `INSERT`/`UPDATE` against
+`employees` needs those options, so pass `-I` to sqlcmd:
+
+```bash
+sqlcmd -S . -E -C -I -d ptecip -Q "UPDATE employees SET ..."
+```
+
+The node driver is unaffected — tedious sets both options ON when it connects.
 
 ## Two places the dialects can legitimately disagree
 

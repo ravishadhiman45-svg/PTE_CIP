@@ -20,11 +20,19 @@ const router = express.Router();
 // version DETERMINISTIC rather than merely matching. That is a deliberate
 // improvement, not an accident — but it means the two can legitimately disagree
 // on a tie, which is worth knowing when diffing outputs.
+// The correlation is on sc.NAME, not sc.id, and that is load-bearing rather
+// than a stylistic choice. The outer query groups by sc.name alone, so sc.id is
+// not available to a correlated subquery — referencing it fails with "invalid in
+// the select list because it is not contained in either an aggregate function or
+// the GROUP BY clause". Correlating on the grouping key also keeps the
+// granularity honest: two categories sharing a name are one row in the outer
+// query, so the mode must be computed over both of them together.
 const DOMINANT_RELEVANCE = sql({
   pg: 'MODE() WITHIN GROUP (ORDER BY s.future_relevance)',
   mssql: `(SELECT TOP 1 s2.future_relevance
                  FROM skills s2
-                WHERE s2.category_id = sc.id AND s2.future_relevance IS NOT NULL
+                 JOIN skill_categories sc2 ON sc2.id = s2.category_id
+                WHERE sc2.name = sc.name AND s2.future_relevance IS NOT NULL
                 GROUP BY s2.future_relevance
                 ORDER BY COUNT(*) DESC, s2.future_relevance)`,
 });

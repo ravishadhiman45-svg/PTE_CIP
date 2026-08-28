@@ -124,6 +124,14 @@ async function runOn(connectable, text, params = []) {
     return shapeResult(await request.query(rewritten));
   } catch (err) {
     annotateMssqlError(err);
+    // Log the translated statement server-side. A T-SQL error alone ("Incorrect
+    // syntax near 'AS'") is close to useless without the SQL it refers to,
+    // especially when the statement was assembled from dual constants and
+    // spliced fragments. Deliberately NOT attached to the error object: the
+    // express handler returns err.message to the client, and SQL does not belong
+    // in an API response.
+    console.error('[db] query failed:', err.message);
+    console.error('[db] statement was:\n' + rewritten);
     throw err;
   }
 }

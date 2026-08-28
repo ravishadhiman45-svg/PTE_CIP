@@ -11,7 +11,22 @@
 const fs = require('fs/promises');
 const path = require('path');
 
-const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '../../uploads'));
+// A RELATIVE UPLOAD_DIR resolves against the server package root, not the
+// process working directory.
+//
+// path.resolve() would use cwd, which is fine when you start the app with
+// `npm run dev` from server/ and quietly wrong everywhere else: a Windows
+// service starts in C:\Windows\System32, and a process manager may start it from
+// the repo root. Either way the app would create a second, empty upload folder
+// and every existing avatar would 404 — with no error anywhere to explain it.
+const SERVER_ROOT = path.resolve(__dirname, '../..');
+
+function resolveUploadDir(configured) {
+  if (!configured) return path.join(SERVER_ROOT, 'uploads');
+  return path.isAbsolute(configured) ? configured : path.resolve(SERVER_ROOT, configured);
+}
+
+const UPLOAD_DIR = resolveUploadDir(process.env.UPLOAD_DIR);
 
 // Absolute, because employees.photo_url is read straight into an <img src>
 // from a DIFFERENT origin (the Next.js client on :3000, the API on :4000).

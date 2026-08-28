@@ -65,9 +65,13 @@ const Q_INSERT_SKILL_FULL = sql({
   pg: `INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
        VALUES ($1,$2,$3,$4,COALESCE($5,'Medium'),COALESCE($6,'Medium'))
        RETURNING id, code, name`,
-  mssql: `INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
-          OUTPUT INSERTED.id, INSERTED.code, INSERTED.name
-          VALUES ($1,$2,$3,$4,COALESCE($5,'Medium'),COALESCE($6,'Medium'))`,
+  // skills carries trg_skills_updated_at, so OUTPUT has to go INTO a table
+  // variable rather than straight to the caller.
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, code NVARCHAR(450), name NVARCHAR(450));
+          INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
+          OUTPUT INSERTED.id, INSERTED.code, INSERTED.name INTO @out
+          VALUES ($1,$2,$3,$4,COALESCE($5,'Medium'),COALESCE($6,'Medium'));
+          SELECT id, code, name FROM @out;`,
 });
 
 // Turns a JSON column into a parsed value regardless of which driver produced

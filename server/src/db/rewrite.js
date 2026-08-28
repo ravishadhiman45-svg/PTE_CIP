@@ -205,6 +205,20 @@ const FORBIDDEN = [
     re: /\b(JSONB?_BUILD_OBJECT|JSONB?_AGG|ROW_TO_JSON)\s*\(/i,
     hint: 'use FOR JSON PATH',
   },
+  // EXISTS in a PROJECTION, not in a WHERE clause.
+  //
+  // Postgres treats EXISTS(...) as a boolean expression, so it can be selected
+  // directly. T-SQL has no boolean expression type: EXISTS is only ever a
+  // predicate, and `EXISTS (...) AS x` in a select list is a syntax error.
+  //
+  // The `) AS` tail is what distinguishes the two uses — EXISTS inside a WHERE
+  // is perfectly portable and must not be flagged. One level of nested parens is
+  // matched, which covers every case in this codebase.
+  {
+    name: 'EXISTS as a column',
+    re: /\bEXISTS\s*\((?:[^()]|\([^()]*\))*\)\s+AS\b/i,
+    hint: 'T-SQL allows EXISTS only as a predicate; use CAST(CASE WHEN EXISTS (...) THEN 1 ELSE 0 END AS bit)',
+  },
   // NULLS FIRST, and the ASC form of NULLS LAST, change ordering semantics.
   // Checked AFTER the DESC NULLS LAST transform has removed the safe case.
   {

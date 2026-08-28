@@ -6,3 +6,7 @@ dist/
 build/
 *.log
 .DS_Store
+
+# Locally stored profile images (STORAGE_DRIVER=localDisk).
+# Back these up with the database — photo_url stores URLs, not bytes.
+server/uploads/

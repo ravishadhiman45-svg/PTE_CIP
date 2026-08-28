@@ -95,17 +95,28 @@ const Q_INSERT_EMPLOYEE = sql({
        VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
           COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
        RETURNING id, employee_code, full_name, email, org_title`,
-  // OUTPUT sits between the column list and VALUES. Returning rows straight to
-  // the caller (rather than OUTPUT ... INTO) is what keeps this compatible with
-  // the AFTER triggers on `employees`.
-  mssql: `INSERT INTO employees
+  // OUTPUT must go INTO a table variable here, not straight to the caller.
+  //
+  // SQL Server refuses "OUTPUT without INTO" on any table carrying an enabled
+  // trigger, and `employees` has two (trg_employees_updated_at and
+  // trg_employees_no_cycle). The error is explicit about it:
+  //   "The target table ... cannot have any enabled triggers if the statement
+  //    contains an OUTPUT clause without INTO clause."
+  // So the rows are captured into @out and selected back, which is permitted.
+  // The trailing SELECT is what the driver returns as the recordset.
+  mssql: `DECLARE @out TABLE (
+            id UNIQUEIDENTIFIER, employee_code NVARCHAR(450), full_name NVARCHAR(450),
+            email NVARCHAR(450), org_title NVARCHAR(450));
+       INSERT INTO employees
          (employee_code, full_name, email, gender, grade, joining_date,
           department_id, team_id, job_role_id, manager_id, location_id, org_title,
           sibling_order)
        OUTPUT INSERTED.id, INSERTED.employee_code, INSERTED.full_name,
               INSERTED.email, INSERTED.org_title
+         INTO @out
        VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
-          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))`,
+          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1));
+       SELECT id, employee_code, full_name, email, org_title FROM @out;`,
 });
 
 const Q_INSERT_APP_USER = sql({
@@ -216,14 +227,19 @@ const Q_REPARENT = sql({
                 COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
         WHERE id = $1
         RETURNING id, full_name, manager_id, org_title, sibling_order`,
-  mssql: `UPDATE employees
+  mssql: `DECLARE @out TABLE (
+            id UNIQUEIDENTIFIER, full_name NVARCHAR(450), manager_id UNIQUEIDENTIFIER,
+            org_title NVARCHAR(450), sibling_order INT);
+        UPDATE employees
           SET manager_id    = $2,
               org_title     = COALESCE($3, org_title),
               sibling_order = COALESCE($4,
                 COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
         OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.manager_id,
                INSERTED.org_title, INSERTED.sibling_order
-        WHERE id = $1`,
+          INTO @out
+        WHERE id = $1;
+        SELECT id, full_name, manager_id, org_title, sibling_order FROM @out;`,
 });
 
 // The only true UPSERT in the codebase, so the only place MERGE is warranted.
@@ -245,7 +261,11 @@ const Q_UPSERT_CV = sql({
                linkedin_url = EXCLUDED.linkedin_url
          RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
                    verification_status`,
-  mssql: `MERGE employee_cv WITH (HOLDLOCK) AS t
+  mssql: `DECLARE @out TABLE (
+            employee_id UNIQUEIDENTIFIER, headline NVARCHAR(MAX), summary NVARCHAR(MAX),
+            phone NVARCHAR(450), location_text NVARCHAR(450), linkedin_url NVARCHAR(450),
+            verification_status NVARCHAR(450));
+          MERGE employee_cv WITH (HOLDLOCK) AS t
           USING (SELECT $1 AS employee_id) AS s ON t.employee_id = s.employee_id
           WHEN MATCHED THEN UPDATE
             SET headline = $2, summary = $3, phone = $4,
@@ -254,7 +274,10 @@ const Q_UPSERT_CV = sql({
             INSERT (employee_id, headline, summary, phone, location_text, linkedin_url)
             VALUES ($1,$2,$3,$4,$5,$6)
           OUTPUT INSERTED.employee_id, INSERTED.headline, INSERTED.summary, INSERTED.phone,
-                 INSERTED.location_text, INSERTED.linkedin_url, INSERTED.verification_status;`,
+                 INSERTED.location_text, INSERTED.linkedin_url, INSERTED.verification_status
+            INTO @out;
+          SELECT employee_id, headline, summary, phone, location_text, linkedin_url,
+                 verification_status FROM @out;`,
 });
 
 const Q_INSERT_EXPERIENCE = sql({
@@ -315,9 +338,11 @@ const Q_INSERT_SKILL_MINIMAL = sql({
   pg: `INSERT INTO skills (code, name, description, category_id)
              VALUES ($1, $2, 'Added from an employee profile', $3)
              RETURNING id`,
-  mssql: `INSERT INTO skills (code, name, description, category_id)
-             OUTPUT INSERTED.id
-             VALUES ($1, $2, 'Added from an employee profile', $3)`,
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER);
+           INSERT INTO skills (code, name, description, category_id)
+             OUTPUT INSERTED.id INTO @out
+             VALUES ($1, $2, 'Added from an employee profile', $3);
+           SELECT id FROM @out;`,
 });
 
 const Q_ASSIGN_SKILL = sql({
@@ -340,18 +365,47 @@ const Q_HAS_OTHER_ASSESSMENT = sql({
             AND assessor_type IN ('Manager','Mentor','SME')`,
 });
 
+// Direct reports — the DOWN side of the record, always full-record visible
+// because anyone you can see has a subtree contained in your own.
+//
+// Postgres selects EXISTS(...) directly, since it is a boolean expression there.
+// T-SQL has no boolean expression type — EXISTS is only ever a predicate — so
+// the projection needs a CASE, cast to bit so the driver still returns a real
+// JS boolean and the API response shape is unchanged.
+const Q_DIRECT_REPORTS = sql({
+  pg: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
+            jr.role_name AS job_role,
+            EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id) AS has_reports
+     FROM employees e
+     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+     WHERE e.manager_id = $1
+     ORDER BY e.sibling_order, e.full_name`,
+  mssql: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
+            jr.role_name AS job_role,
+            CAST(CASE WHEN EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id)
+                      THEN 1 ELSE 0 END AS bit) AS has_reports
+     FROM employees e
+     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+     WHERE e.manager_id = $1
+     ORDER BY e.sibling_order, e.full_name`,
+});
+
 const Q_SET_PHOTO = sql({
   pg: 'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
-  mssql: `UPDATE employees SET photo_url = $2
-          OUTPUT INSERTED.id, INSERTED.photo_url
-          WHERE id = $1`,
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
+          UPDATE employees SET photo_url = $2
+          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
+          WHERE id = $1;
+          SELECT id, photo_url FROM @out;`,
 });
 
 const Q_CLEAR_PHOTO = sql({
   pg: 'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
-  mssql: `UPDATE employees SET photo_url = NULL
-          OUTPUT INSERTED.id, INSERTED.photo_url
-          WHERE id = $1`,
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
+          UPDATE employees SET photo_url = NULL
+          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
+          WHERE id = $1;
+          SELECT id, photo_url FROM @out;`,
 });
 
 // Make sure the 1:1 CV row exists before updating it.
@@ -695,16 +749,7 @@ async function loadProfile(id) {
 
   // Direct reports — the DOWN side of the record, always full-record visible
   // because anyone you can see has a subtree contained in your own.
-  const reportsP = query(
-    `SELECT e.id, e.full_name, e.org_title, e.photo_url,
-            jr.role_name AS job_role,
-            EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id) AS has_reports
-     FROM employees e
-     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-     WHERE e.manager_id = $1
-     ORDER BY e.sibling_order, e.full_name`,
-    [id]
-  );
+  const reportsP = query(Q_DIRECT_REPORTS, [id]);
 
   // The UP side: name + title only, all the way to the Executive Officer.
   const chainP = managerChain(id);

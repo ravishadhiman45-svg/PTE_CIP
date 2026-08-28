@@ -177,9 +177,15 @@ GO
 -- unaffected by the row's own manager_id, so it reads the same before and after
 -- the write, and needs no snapshot semantics.
 --
--- An AFTER trigger is also deliberate rather than incidental: an INSTEAD OF
--- trigger on `employees` would break the OUTPUT clause that
--- routes/employees.js relies on for its INSERT and UPDATE statements.
+-- AFTER rather than INSTEAD OF is deliberate for a plainer reason: an INSTEAD OF
+-- trigger has to perform the write itself, so it would need to re-implement the
+-- INSERT and UPDATE (defaults, the sibling_order subquery) and stay in step with
+-- them forever. An AFTER trigger only has to answer a yes/no question.
+--
+-- Note separately that ANY enabled trigger on this table — including the two
+-- here — makes "OUTPUT without INTO" illegal, which is why every statement in
+-- routes/employees.js that needs its rows back captures OUTPUT INTO a table
+-- variable. See db/README.md.
 --
 -- Error 50007 must stay in step with CYCLE_ERROR_NUMBER in
 -- server/src/db/errors.js, which maps it to SQLSTATE 23514 so the API returns

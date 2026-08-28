@@ -176,6 +176,59 @@ test('conditional inserts guard the existence check with UPDLOCK/HOLDLOCK', () =
   assert.deepEqual(failures, [], `\nmissing locking hint:\n${failures.join('\n')}\n`);
 });
 
+// Tables carrying an enabled trigger in db/mssql/01_schema.sql and
+// db/mssql/07_org_hierarchy.sql. Keep in step with those files.
+const TRIGGERED_TABLES = [
+  'employees',
+  'employee_cv',
+  'skills',
+  'training_courses',
+  'job_roles',
+  'organizations',
+];
+
+test('OUTPUT on a trigger-bearing table goes INTO a table variable', () => {
+  // SQL Server refuses "OUTPUT without INTO" when the target has an enabled
+  // trigger:
+  //   "The target table ... cannot have any enabled triggers if the statement
+  //    contains an OUTPUT clause without INTO clause."
+  //
+  // This is invisible to the rewriter (the SQL is valid T-SQL in isolation) and
+  // invisible to a schema check, and it only fails on the WRITE path — so it
+  // survives any amount of read-only testing. Every affected statement must
+  // capture into a table variable and select back.
+  const failures = [];
+
+  for (const b of mssqlBranches) {
+    if (!/\bOUTPUT\b/i.test(b.text)) continue;
+
+    const target = TRIGGERED_TABLES.find((t) =>
+      new RegExp(`\\b(INSERT\\s+INTO|UPDATE|MERGE|DELETE\\s+FROM)\\s+${t}\\b`, 'i').test(b.text)
+    );
+    if (!target) continue;
+
+    if (!/\bOUTPUT\b[\s\S]*?\bINTO\b/i.test(b.text)) {
+      failures.push(`${b.file}:${b.line} — OUTPUT on ${target} needs INTO @table`);
+    }
+  }
+
+  assert.deepEqual(failures, [], `\n${failures.join('\n')}\n`);
+});
+
+test('a statement that captures OUTPUT also selects it back', () => {
+  // Capturing into a table variable and forgetting the trailing SELECT would
+  // return zero rows, and the route would read rows[0] as undefined — a silent
+  // wrong answer rather than an error.
+  const failures = [];
+  for (const b of mssqlBranches) {
+    if (!/\bOUTPUT\b[\s\S]*?\bINTO\s+@/i.test(b.text)) continue;
+    if (!/\bSELECT\b[\s\S]*\bFROM\s+@/i.test(b.text)) {
+      failures.push(`${b.file}:${b.line} — captures OUTPUT but never selects from the table variable`);
+    }
+  }
+  assert.deepEqual(failures, [], `\n${failures.join('\n')}\n`);
+});
+
 test('OFFSET/FETCH is only used where an ORDER BY exists', () => {
   // T-SQL requires ORDER BY for OFFSET/FETCH; Postgres LIMIT does not, so this
   // is easy to get wrong when translating.
