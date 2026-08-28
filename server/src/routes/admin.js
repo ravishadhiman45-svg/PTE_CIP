@@ -23,7 +23,8 @@ router.get('/users', async (req, res, next) => {
        LEFT JOIN job_roles jr ON jr.id = e.job_role_id
        LEFT JOIN user_permission_role_map m ON m.user_id = au.id
        LEFT JOIN app_permission_roles pr ON pr.id = m.permission_role_id
-       GROUP BY au.id, e.employee_code, d.name, jr.role_name
+       GROUP BY au.id, au.email, au.display_name, au.is_active, au.last_login_at,
+                e.employee_code, d.name, jr.role_name
        ORDER BY au.display_name`
     );
     res.json(rows);
@@ -57,7 +58,8 @@ router.get('/permission-roles', async (req, res, next) => {
               COUNT(m.user_id) AS user_count
        FROM app_permission_roles pr
        LEFT JOIN user_permission_role_map m ON m.permission_role_id = pr.id
-       GROUP BY pr.id ORDER BY pr.role_name`
+       GROUP BY pr.id, pr.role_key, pr.role_name, pr.description
+       ORDER BY pr.role_name`
     );
     res.json(rows);
   } catch (err) {

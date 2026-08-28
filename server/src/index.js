@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { requireAuth } = require('./middleware/auth');
+const storage = require('./storage');
 
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
@@ -34,8 +35,32 @@ app.use(
 );
 app.use(express.json());
 
-// Health check (public).
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'ptecip-api' }));
+// Profile images, when they live on this machine's disk rather than in a hosted
+// bucket. Public on purpose: these URLs are stored in employees.photo_url and
+// rendered straight into an <img src>, exactly as the bucket's public URLs were.
+//
+// `immutable` is safe because the object key is timestamped on every upload
+// (routes/employees.js:990) — a changed picture is a changed URL, never a
+// changed body at the same URL.
+if (storage.driver === 'localDisk') {
+  app.use(
+    '/files',
+    express.static(storage.UPLOAD_DIR, {
+      maxAge: '1y',
+      immutable: true,
+      index: false,
+      // Never serve a directory listing or a dotfile out of the upload tree.
+      dotfiles: 'ignore',
+      redirect: false,
+    })
+  );
+}
+
+// Health check (public). Reports the resolved dialect and storage driver so an
+// on-premise deployment can be verified without shell access to the box.
+app.get('/api/health', (req, res) =>
+  res.json({ ok: true, service: 'ptecip-api', dialect: db.dialect, storage: storage.driver })
+);
 
 // Auth (public).
 app.use('/api/auth', authRoutes);

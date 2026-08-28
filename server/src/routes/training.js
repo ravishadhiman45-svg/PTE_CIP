@@ -42,7 +42,9 @@ router.get('/', async (req, res, next) => {
        LEFT JOIN course_skill_map csm ON csm.course_id = tc.id
        LEFT JOIN skills s ON s.id = csm.skill_id
        ${whereSql}
-       GROUP BY tc.id, sme.full_name, coord.full_name
+       GROUP BY tc.id, tc.course_code, tc.title, tc.description, tc.course_type,
+                tc.delivery_mode, tc.duration_hours, tc.difficulty, tc.status,
+                sme.full_name, coord.full_name
        ORDER BY tc.title`,
       params
     );

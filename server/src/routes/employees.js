@@ -2,11 +2,11 @@
 // and the self-service CV editing endpoints.
 const express = require('express');
 const multer = require('multer');
-const { query, pool } = require('../db');
+const { query, withTransaction, sql, isUniqueViolation } = require('../db');
 const { requireRole, requireSelfOrAdmin, requireVisible } = require('../middleware/auth');
 const { visibleIdsSql, canView, managerChain } = require('../lib/visibility');
 const { streamCvPdf, cvFileName } = require('../lib/cvPdf');
-const { uploadPublicFile, removePublicFolder } = require('../supabase');
+const { uploadPublicFile, removePublicFolder } = require('../storage');
 const { insertDefaultLevelDefinitions } = require('../lib/skillLevels');
 
 const router = express.Router();
@@ -48,12 +48,72 @@ function uploadPhoto(req, res, next) {
 // Helpers
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// Dialect-divergent SQL
+//
+// These statements use Postgres constructs with no token-level T-SQL
+// equivalent, so each is written out per dialect. Both branches take the SAME
+// params array, and both still go through the rewriter ($n -> @pn, dbo.
+// qualification, boolean marshalling) — only the STRUCTURE is overridden.
+//
+// The T-SQL conditional inserts use WITH (UPDLOCK, HOLDLOCK) on the existence
+// check. That is the standard idiom for a race-free "insert if absent": a bare
+// NOT EXISTS lets two concurrent callers both see "absent" and one then hits a
+// primary-key violation, whereas ON CONFLICT DO NOTHING is atomic. The locking
+// hint restores the atomicity the Postgres version had.
+// ---------------------------------------------------------------
+
+const Q_ENSURE_CV = sql({
+  pg: 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
+  mssql: `INSERT INTO employee_cv (employee_id)
+          SELECT $1 WHERE NOT EXISTS (
+            SELECT 1 FROM employee_cv WITH (UPDLOCK, HOLDLOCK) WHERE employee_id = $1)`,
+});
+
+const Q_INSERT_EMPLOYEE = sql({
+  pg: `INSERT INTO employees
+         (employee_code, full_name, email, gender, grade, joining_date,
+          department_id, team_id, job_role_id, manager_id, location_id, org_title,
+          sibling_order)
+       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
+          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
+       RETURNING id, employee_code, full_name, email, org_title`,
+  // OUTPUT sits between the column list and VALUES. Returning rows straight to
+  // the caller (rather than OUTPUT ... INTO) is what keeps this compatible with
+  // the AFTER triggers on `employees`.
+  mssql: `INSERT INTO employees
+         (employee_code, full_name, email, gender, grade, joining_date,
+          department_id, team_id, job_role_id, manager_id, location_id, org_title,
+          sibling_order)
+       OUTPUT INSERTED.id, INSERTED.employee_code, INSERTED.full_name,
+              INSERTED.email, INSERTED.org_title
+       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
+          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))`,
+});
+
+const Q_INSERT_APP_USER = sql({
+  pg: `INSERT INTO app_users (employee_id, email, display_name)
+       VALUES ($1,$2,$3) RETURNING id`,
+  mssql: `INSERT INTO app_users (employee_id, email, display_name)
+          OUTPUT INSERTED.id
+          VALUES ($1,$2,$3)`,
+});
+
+const Q_GRANT_DEFAULT_ROLE = sql({
+  pg: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
+       SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
+       ON CONFLICT DO NOTHING`,
+  mssql: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
+          SELECT $1, pr.id FROM app_permission_roles pr
+           WHERE pr.role_key = 'employee'
+             AND NOT EXISTS (
+               SELECT 1 FROM user_permission_role_map m WITH (UPDLOCK, HOLDLOCK)
+                WHERE m.user_id = $1 AND m.permission_role_id = pr.id)`,
+});
+
 // Make sure the 1:1 CV row exists before updating it.
 function ensureCv(client, employeeId) {
-  return client.query(
-    'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
-    [employeeId]
-  );
+  return client.query(Q_ENSURE_CV, [employeeId]);
 }
 
 // Any CV edit invalidates a previous verification: back to Draft, and any
@@ -73,26 +133,19 @@ async function resetVerification(client, employeeId) {
   );
 }
 
-// Runs fn(client) inside a transaction.
-async function withTransaction(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-const EXPERIENCE_COLUMNS = `id, title, organization,
+// Dates are projected as plain YYYY-MM-DD strings rather than timestamps, so the
+// client never has to reason about timezones for a date-only field.
+const EXPERIENCE_COLUMNS = sql({
+  pg: `id, title, organization,
   to_char(start_date, 'YYYY-MM-DD') AS start_date,
   to_char(end_date, 'YYYY-MM-DD') AS end_date,
-  description, sort_order`;
+  description, sort_order`,
+  // CONVERT style 23 is ISO yyyy-mm-dd.
+  mssql: `id, title, organization,
+  CONVERT(varchar(10), start_date, 23) AS start_date,
+  CONVERT(varchar(10), end_date, 23) AS end_date,
+  description, sort_order`,
+});
 
 const EDUCATION_COLUMNS =
   'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
@@ -190,19 +243,9 @@ router.post('/', requireRole(...MANAGE_ROLES), async (req, res, next) => {
       .json({ error: 'You can only add people under yourself or someone who reports to you' });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
-    const emp = await client.query(
-      `INSERT INTO employees
-         (employee_code, full_name, email, gender, grade, joining_date,
-          department_id, team_id, job_role_id, manager_id, location_id, org_title,
-          sibling_order)
-       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
-          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
-       RETURNING id, employee_code, full_name, email, org_title`,
-      [
+    const employee = await withTransaction(async (client) => {
+      const emp = await client.query(Q_INSERT_EMPLOYEE, [
         employee_code,
         full_name,
         email,
@@ -215,35 +258,24 @@ router.post('/', requireRole(...MANAGE_ROLES), async (req, res, next) => {
         manager_id,
         location_id || null,
         org_title || null,
-      ]
-    );
-    const employee = emp.rows[0];
+      ]);
+      const created = emp.rows[0];
 
-    if (create_login) {
-      const user = await client.query(
-        `INSERT INTO app_users (employee_id, email, display_name)
-         VALUES ($1,$2,$3) RETURNING id`,
-        [employee.id, email, full_name]
-      );
-      await client.query(
-        `INSERT INTO user_permission_role_map (user_id, permission_role_id)
-         SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
-         ON CONFLICT DO NOTHING`,
-        [user.rows[0].id]
-      );
-    }
+      if (create_login) {
+        const user = await client.query(Q_INSERT_APP_USER, [created.id, email, full_name]);
+        await client.query(Q_GRANT_DEFAULT_ROLE, [user.rows[0].id]);
+      }
 
-    await client.query('COMMIT');
+      return created;
+    });
+
     res.status(201).json(employee);
   } catch (err) {
-    await client.query('ROLLBACK');
     // Friendly message for duplicate code/email.
-    if (err.code === '23505') {
+    if (isUniqueViolation(err)) {
       return res.status(409).json({ error: 'An employee with that code or email already exists' });
     }
     next(err);
-  } finally {
-    client.release();
   }
 });
 

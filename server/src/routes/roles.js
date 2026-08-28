@@ -22,7 +22,8 @@ router.get('/', async (req, res, next) => {
        FROM job_roles jr
        LEFT JOIN job_role_skill_benchmarks b ON b.job_role_id = jr.id
        LEFT JOIN employees e ON e.job_role_id = jr.id AND e.id IN (${scope})
-       GROUP BY jr.id
+       GROUP BY jr.id, jr.code, jr.role_name, jr.role_family, jr.function_area,
+                jr.role_level, jr.criticality, jr.is_future_role
        ORDER BY jr.role_name`,
       params
     );

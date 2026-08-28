@@ -11,7 +11,7 @@
 // employee, who has none. Verification now goes UP the chain instead, which is
 // also the direction it means something.
 const express = require('express');
-const { query, pool } = require('../db');
+const { query, withTransaction, sql } = require('../db');
 
 const router = express.Router();
 
@@ -46,21 +46,6 @@ router.get('/approvers', async (req, res, next) => {
     next(err);
   }
 });
-
-async function withTransaction(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
 
 // POST /api/verification/request  { approver_employee_id, message? }
 router.post('/request', async (req, res, next) => {
