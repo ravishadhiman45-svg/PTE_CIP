@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { requireAuth } = require('./middleware/auth');
+const db = require('./db');
 const storage = require('./storage');
 
 const authRoutes = require('./routes/auth');
@@ -93,6 +94,28 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`PTE CIP API listening on http://localhost:${PORT}`);
-});
+
+// Verify the database before binding a port.
+//
+// The self-test exercises the three things most likely to be wrong on a fresh
+// on-premise install, in the order they would fail: the connection, boolean and
+// uuid parameter round-tripping, and whether the DDL was ever loaded (the
+// visibility function exists). Discovering any of those from a 500 on request
+// forty is much worse than refusing to start.
+async function main() {
+  try {
+    await db.selfTest();
+  } catch (err) {
+    console.error(`[startup] database check failed (dialect=${db.dialect})`);
+    console.error(err.message);
+    process.exit(1);
+  }
+
+  console.log(`[startup] dialect=${db.dialect} storage=${storage.driver}`);
+
+  app.listen(PORT, () => {
+    console.log(`PTE CIP API listening on http://localhost:${PORT}`);
+  });
+}
+
+main();
