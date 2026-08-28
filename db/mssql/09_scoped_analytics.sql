@@ -1,3 +1,14 @@
+-- Session options, set explicitly rather than inherited from the client.
+--
+-- sqlcmd defaults QUOTED_IDENTIFIER to OFF while SSMS and Azure Data Studio
+-- default it ON, so a file that relies on the client's default loads in one tool
+-- and fails in another. Filtered indexes (uq_employees_single_root) REQUIRE both
+-- of these, and views/functions/triggers bake the options in at CREATE time — so
+-- getting them right here also decides how those objects behave later.
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
 -- =============================================================
 -- PTE CIP — SUBTREE-SCOPED ANALYTICS (SQL Server)
 --
