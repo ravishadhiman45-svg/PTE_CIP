@@ -135,7 +135,7 @@ router.get('/', async (req, res, next) => {
        ORDER BY s.name`,
       params
     );
-    res.json(rows);
+    res.json(parseJsonColumn(rows, 'labels'));
   } catch (err) {
     next(err);
   }

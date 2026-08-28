@@ -230,6 +230,37 @@ function walk(dir, acc = []) {
   return acc;
 }
 
+// Which dual-constant branch a literal belongs to, or null if it is not in one.
+function dualBranchKind(src, index) {
+  const before = src.slice(Math.max(0, index - 40), index);
+  const m = /\b(pg|mssql)\s*:\s*$/.exec(before);
+  return m ? m[1] : null;
+}
+
+// Collects every `mssql:` branch in the server source. The test suite uses this
+// to prove each one survives the rewriter — a gap the lint itself cannot close,
+// because it deliberately EXEMPTS dual branches from the forbidden check. A
+// Postgres-ism accidentally left in an mssql branch would otherwise be found
+// only when that statement executed against a customer's database.
+function collectDualBranches(root = ROOT) {
+  const out = [];
+  for (const file of walk(root).sort()) {
+    if (file.includes(`${path.sep}db${path.sep}`)) continue;
+    const src = fs.readFileSync(file, 'utf8');
+    const rel = path.relative(path.resolve(__dirname, '..'), file).split(path.sep).join('/');
+    for (const lit of extractLiterals(src)) {
+      const kind = dualBranchKind(src, lit.index);
+      if (kind) out.push({ kind, file: rel, line: lit.line, text: lit.text });
+    }
+  }
+  return out;
+}
+
+module.exports = { extractLiterals, looksLikeSql, checkGroupBy, collectDualBranches, walk, ROOT };
+
+// Everything below is the CLI. Skipped when this file is require()d.
+if (require.main !== module) return;
+
 // ---------------------------------------------------------------------------
 
 const files = walk(ROOT).sort();

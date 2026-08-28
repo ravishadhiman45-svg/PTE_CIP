@@ -133,7 +133,14 @@ const FORBIDDEN = [
     re: /\bLIMIT\b/i,
     hint: 'T-SQL needs TOP or OFFSET/FETCH, and LIMIT inside a correlated subquery cannot be relocated safely',
   },
-  { name: 'OFFSET', re: /\bOFFSET\b/i, hint: 'use OFFSET/FETCH with an explicit ORDER BY' },
+  // Postgres `OFFSET n` only. The T-SQL form is `OFFSET n ROWS FETCH NEXT m
+  // ROWS ONLY`, which is legitimate and must not be flagged — hence the
+  // lookahead for a following ROWS rather than a bare keyword match.
+  {
+    name: 'OFFSET',
+    re: /\bOFFSET\b(?!\s+\S+\s+ROWS\b)/i,
+    hint: 'use OFFSET n ROWS FETCH NEXT m ROWS ONLY, with an explicit ORDER BY',
+  },
   { name: '::cast', re: /::/, hint: 'use CAST(x AS type)' },
   {
     name: 'ON CONFLICT',

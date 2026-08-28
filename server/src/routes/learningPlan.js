@@ -1,6 +1,6 @@
 // Learning plan Kanban.
 const express = require('express');
-const { query } = require('../db');
+const { query, sql } = require('../db');
 const { requireVisible } = require('../middleware/auth');
 const { isAdmin } = require('../lib/visibility');
 
@@ -78,9 +78,14 @@ router.patch('/items/:id', async (req, res, next) => {
     }
 
     const { rows } = await query(
-      `UPDATE learning_plan_items SET ${sets.join(', ')}
+      sql({
+        pg: `UPDATE learning_plan_items SET ${sets.join(', ')}
        WHERE id = ${idParam}${ownership}
        RETURNING id, status, progress_percent, completed_at`,
+        mssql: `UPDATE learning_plan_items SET ${sets.join(', ')}
+       OUTPUT INSERTED.id, INSERTED.status, INSERTED.progress_percent, INSERTED.completed_at
+       WHERE id = ${idParam}${ownership}`,
+      }),
       params
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Item not found' });

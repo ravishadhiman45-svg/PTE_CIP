@@ -48,6 +48,23 @@ function uploadPhoto(req, res, next) {
 // Helpers
 // ---------------------------------------------------------------
 
+// Dates are projected as plain YYYY-MM-DD strings rather than timestamps, so the
+// client never has to reason about timezones for a date-only field.
+const EXPERIENCE_COLUMNS = sql({
+  pg: `id, title, organization,
+  to_char(start_date, 'YYYY-MM-DD') AS start_date,
+  to_char(end_date, 'YYYY-MM-DD') AS end_date,
+  description, sort_order`,
+  // CONVERT style 23 is ISO yyyy-mm-dd.
+  mssql: `id, title, organization,
+  CONVERT(varchar(10), start_date, 23) AS start_date,
+  CONVERT(varchar(10), end_date, 23) AS end_date,
+  description, sort_order`,
+});
+
+const EDUCATION_COLUMNS =
+  'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
+
 // ---------------------------------------------------------------
 // Dialect-divergent SQL
 //
@@ -111,6 +128,232 @@ const Q_GRANT_DEFAULT_ROLE = sql({
                 WHERE m.user_id = $1 AND m.permission_role_id = pr.id)`,
 });
 
+
+// --- Scalar / projection fragments -----------------------------------------
+
+// COUNT(*) is bigint, which pg returns as a STRING. The ::int cast is what
+// makes it a JS number, and T-SQL needs the same cast for the same reason.
+const DIRECT_REPORTS_COUNT = sql({
+  pg: '(SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id)',
+  mssql: '(SELECT CAST(count(*) AS int) FROM employees c WHERE c.manager_id = e.id)',
+});
+const SUBTREE_COUNT = sql({
+  pg: '(SELECT count(*)::int FROM employee_subtree(e.id))',
+  mssql: '(SELECT CAST(count(*) AS int) FROM dbo.employee_subtree(e.id))',
+});
+
+// LIMIT 1 inside a CORRELATED SCALAR SUBQUERY — the shape the rewriter refuses
+// to touch, because relocating the token to TOP would bind it to the outer
+// SELECT and silently truncate the whole result set.
+const ACTIVE_MENTOR_NAME = sql({
+  pg: `(SELECT me.full_name FROM mentor_assignments ma
+               JOIN employees me ON me.id = ma.mentor_id
+               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
+               ORDER BY ma.start_date ASC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 me.full_name FROM mentor_assignments ma
+               JOIN employees me ON me.id = ma.mentor_id
+               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
+               ORDER BY ma.start_date ASC)`,
+});
+
+const LATEST_TARGET_ROLE = sql({
+  pg: `(SELECT jr2.role_name FROM mentor_recommendations mr
+               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
+               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
+               ORDER BY mr.submitted_at DESC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 jr2.role_name FROM mentor_recommendations mr
+               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
+               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
+               ORDER BY mr.submitted_at DESC)`,
+});
+
+const PENDING_APPROVER = sql({
+  pg: `(SELECT ap.full_name FROM approvals a
+               JOIN employees ap ON ap.id = a.approver_id
+               WHERE a.approval_type = 'Profile Verification'
+                 AND a.entity_id = e.id AND a.status = 'Pending'
+               ORDER BY a.requested_at DESC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 ap.full_name FROM approvals a
+               JOIN employees ap ON ap.id = a.approver_id
+               WHERE a.approval_type = 'Profile Verification'
+                 AND a.entity_id = e.id AND a.status = 'Pending'
+               ORDER BY a.requested_at DESC)`,
+});
+
+// Projection lists reused by the OUTPUT clauses below. OUTPUT accepts
+// expressions over INSERTED columns, so the date formatting survives.
+const EXPERIENCE_OUTPUT = `INSERTED.id, INSERTED.title, INSERTED.organization,
+  CONVERT(varchar(10), INSERTED.start_date, 23) AS start_date,
+  CONVERT(varchar(10), INSERTED.end_date, 23) AS end_date,
+  INSERTED.description, INSERTED.sort_order`;
+
+const EDUCATION_OUTPUT = `INSERTED.id, INSERTED.degree, INSERTED.institution,
+  INSERTED.field_of_study, INSERTED.start_year, INSERTED.end_year,
+  INSERTED.grade, INSERTED.sort_order`;
+
+// --- Statements -------------------------------------------------------------
+
+// An outer LIMIT with an ORDER BY already present, so OFFSET/FETCH applies
+// cleanly (it requires the ORDER BY that LIMIT does not).
+const Q_RECENT_LEARNING = sql({
+  pg: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
+     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
+     LIMIT 8`,
+  mssql: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
+     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
+     OFFSET 0 ROWS FETCH NEXT 8 ROWS ONLY`,
+});
+
+const Q_REPARENT = sql({
+  pg: `UPDATE employees
+          SET manager_id    = $2,
+              org_title     = COALESCE($3, org_title),
+              sibling_order = COALESCE($4,
+                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
+        WHERE id = $1
+        RETURNING id, full_name, manager_id, org_title, sibling_order`,
+  mssql: `UPDATE employees
+          SET manager_id    = $2,
+              org_title     = COALESCE($3, org_title),
+              sibling_order = COALESCE($4,
+                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
+        OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.manager_id,
+               INSERTED.org_title, INSERTED.sibling_order
+        WHERE id = $1`,
+});
+
+// The only true UPSERT in the codebase, so the only place MERGE is warranted.
+//
+// WITH (HOLDLOCK) is required, not decorative: without it MERGE can raise a
+// duplicate-key error under concurrency, because the match test and the insert
+// are not serialised. This is the documented fix and it restores the atomicity
+// ON CONFLICT DO UPDATE has by construction.
+//
+// MERGE must be terminated by a semicolon.
+const Q_UPSERT_CV = sql({
+  pg: `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (employee_id) DO UPDATE
+           SET headline = EXCLUDED.headline,
+               summary = EXCLUDED.summary,
+               phone = EXCLUDED.phone,
+               location_text = EXCLUDED.location_text,
+               linkedin_url = EXCLUDED.linkedin_url
+         RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
+                   verification_status`,
+  mssql: `MERGE employee_cv WITH (HOLDLOCK) AS t
+          USING (SELECT $1 AS employee_id) AS s ON t.employee_id = s.employee_id
+          WHEN MATCHED THEN UPDATE
+            SET headline = $2, summary = $3, phone = $4,
+                location_text = $5, linkedin_url = $6
+          WHEN NOT MATCHED THEN
+            INSERT (employee_id, headline, summary, phone, location_text, linkedin_url)
+            VALUES ($1,$2,$3,$4,$5,$6)
+          OUTPUT INSERTED.employee_id, INSERTED.headline, INSERTED.summary, INSERTED.phone,
+                 INSERTED.location_text, INSERTED.linkedin_url, INSERTED.verification_status;`,
+});
+
+const Q_INSERT_EXPERIENCE = sql({
+  pg: `INSERT INTO employee_experience
+           (employee_id, title, organization, start_date, end_date, description, sort_order)
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))
+         RETURNING ${EXPERIENCE_COLUMNS}`,
+  mssql: `INSERT INTO employee_experience
+           (employee_id, title, organization, start_date, end_date, description, sort_order)
+         OUTPUT ${EXPERIENCE_OUTPUT}
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))`,
+});
+
+const Q_UPDATE_EXPERIENCE = sql({
+  pg: `UPDATE employee_experience
+            SET title = $3, organization = $4, start_date = $5, end_date = $6,
+                description = $7, sort_order = COALESCE($8, sort_order)
+          WHERE id = $1 AND employee_id = $2
+          RETURNING ${EXPERIENCE_COLUMNS}`,
+  mssql: `UPDATE employee_experience
+            SET title = $3, organization = $4, start_date = $5, end_date = $6,
+                description = $7, sort_order = COALESCE($8, sort_order)
+          OUTPUT ${EXPERIENCE_OUTPUT}
+          WHERE id = $1 AND employee_id = $2`,
+});
+
+const Q_INSERT_EDUCATION = sql({
+  pg: `INSERT INTO employee_education
+           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))
+         RETURNING ${EDUCATION_COLUMNS}`,
+  mssql: `INSERT INTO employee_education
+           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
+         OUTPUT ${EDUCATION_OUTPUT}
+         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))`,
+});
+
+const Q_UPDATE_EDUCATION = sql({
+  pg: `UPDATE employee_education
+            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
+                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
+          WHERE id = $1 AND employee_id = $2
+          RETURNING ${EDUCATION_COLUMNS}`,
+  mssql: `UPDATE employee_education
+            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
+                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
+          OUTPUT ${EDUCATION_OUTPUT}
+          WHERE id = $1 AND employee_id = $2`,
+});
+
+// No ORDER BY here, so TOP rather than OFFSET/FETCH.
+const Q_FIND_SKILL_BY_NAME = sql({
+  pg: 'SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1',
+  mssql: 'SELECT TOP 1 id FROM skills WHERE name LIKE $1',
+});
+
+const Q_INSERT_SKILL_MINIMAL = sql({
+  pg: `INSERT INTO skills (code, name, description, category_id)
+             VALUES ($1, $2, 'Added from an employee profile', $3)
+             RETURNING id`,
+  mssql: `INSERT INTO skills (code, name, description, category_id)
+             OUTPUT INSERTED.id
+             VALUES ($1, $2, 'Added from an employee profile', $3)`,
+});
+
+const Q_ASSIGN_SKILL = sql({
+  pg: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (employee_id, skill_id) DO NOTHING`,
+  mssql: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
+         SELECT $1,$2,$3 WHERE NOT EXISTS (
+           SELECT 1 FROM employee_skill_assignments WITH (UPDLOCK, HOLDLOCK)
+            WHERE employee_id = $1 AND skill_id = $2)`,
+});
+
+const Q_HAS_OTHER_ASSESSMENT = sql({
+  pg: `SELECT 1 FROM skill_assessments
+          WHERE employee_id = $1 AND skill_id = $2
+            AND assessor_type IN ('Manager','Mentor','SME')
+          LIMIT 1`,
+  mssql: `SELECT TOP 1 1 FROM skill_assessments
+          WHERE employee_id = $1 AND skill_id = $2
+            AND assessor_type IN ('Manager','Mentor','SME')`,
+});
+
+const Q_SET_PHOTO = sql({
+  pg: 'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
+  mssql: `UPDATE employees SET photo_url = $2
+          OUTPUT INSERTED.id, INSERTED.photo_url
+          WHERE id = $1`,
+});
+
+const Q_CLEAR_PHOTO = sql({
+  pg: 'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
+  mssql: `UPDATE employees SET photo_url = NULL
+          OUTPUT INSERTED.id, INSERTED.photo_url
+          WHERE id = $1`,
+});
+
 // Make sure the 1:1 CV row exists before updating it.
 function ensureCv(client, employeeId) {
   return client.query(Q_ENSURE_CV, [employeeId]);
@@ -132,23 +375,6 @@ async function resetVerification(client, employeeId) {
     [employeeId]
   );
 }
-
-// Dates are projected as plain YYYY-MM-DD strings rather than timestamps, so the
-// client never has to reason about timezones for a date-only field.
-const EXPERIENCE_COLUMNS = sql({
-  pg: `id, title, organization,
-  to_char(start_date, 'YYYY-MM-DD') AS start_date,
-  to_char(end_date, 'YYYY-MM-DD') AS end_date,
-  description, sort_order`,
-  // CONVERT style 23 is ISO yyyy-mm-dd.
-  mssql: `id, title, organization,
-  CONVERT(varchar(10), start_date, 23) AS start_date,
-  CONVERT(varchar(10), end_date, 23) AS end_date,
-  description, sort_order`,
-});
-
-const EDUCATION_COLUMNS =
-  'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
 
 // Turn a typed skill name into a unique code, e.g. "Battery BMS" -> "BATTERY-BMS".
 async function uniqueSkillCode(client, name) {
@@ -324,8 +550,8 @@ router.get('/me', async (req, res, next) => {
       `SELECT e.id, e.full_name, e.email, e.employee_code, e.photo_url, e.org_title,
               e.grade, jr.role_name AS job_role, d.name AS department, t.name AS team,
               mgr.full_name AS manager_name,
-              (SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id) AS direct_reports,
-              (SELECT count(*)::int FROM employee_subtree(e.id)) AS visible_people
+              ${DIRECT_REPORTS_COUNT} AS direct_reports,
+              ${SUBTREE_COUNT} AS visible_people
        FROM employees e
        LEFT JOIN job_roles jr ON jr.id = e.job_role_id
        LEFT JOIN departments d ON d.id = e.department_id
@@ -363,7 +589,7 @@ router.get('/org-chart', async (req, res, next) => {
        LEFT JOIN job_roles jr ON jr.id = e.job_role_id
        LEFT JOIN departments d ON d.id = e.department_id
        WHERE t.id IN (${scope})
-       ORDER BY string_to_array(t.structural_code, '.')::int[]`,
+       ORDER BY t.sort_key`,
       params
     );
 
@@ -393,14 +619,8 @@ async function loadProfile(id) {
             jr.role_name AS job_role, d.name AS department, t.name AS team,
             l.name AS location,
             mgr.full_name AS manager_name,
-            (SELECT me.full_name FROM mentor_assignments ma
-               JOIN employees me ON me.id = ma.mentor_id
-               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
-               ORDER BY ma.start_date ASC LIMIT 1) AS mentor_name,
-            (SELECT jr2.role_name FROM mentor_recommendations mr
-               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
-               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
-               ORDER BY mr.submitted_at DESC LIMIT 1) AS target_role
+            ${ACTIVE_MENTOR_NAME} AS mentor_name,
+            ${LATEST_TARGET_ROLE} AS target_role
      FROM employees e
      LEFT JOIN job_roles jr ON jr.id = e.job_role_id
      LEFT JOIN departments d ON d.id = e.department_id
@@ -417,11 +637,7 @@ async function loadProfile(id) {
             cv.headline, cv.summary, cv.phone, cv.location_text, cv.linkedin_url,
             cv.verified_at, cv.updated_at,
             vb.full_name AS verified_by_name,
-            (SELECT ap.full_name FROM approvals a
-               JOIN employees ap ON ap.id = a.approver_id
-               WHERE a.approval_type = 'Profile Verification'
-                 AND a.entity_id = e.id AND a.status = 'Pending'
-               ORDER BY a.requested_at DESC LIMIT 1) AS pending_with
+            ${PENDING_APPROVER} AS pending_with
      FROM employees e
      LEFT JOIN employee_cv cv ON cv.employee_id = e.id
      LEFT JOIN employees vb ON vb.id = cv.verified_by
@@ -452,11 +668,7 @@ async function loadProfile(id) {
   );
 
   const recentLearningP = query(
-    `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
-     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
-     WHERE te.employee_id = $1
-     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
-     LIMIT 8`,
+    Q_RECENT_LEARNING,
     [id]
   );
 
@@ -596,13 +808,7 @@ router.patch('/:id/manager', requireRole(...MANAGE_ROLES), requireVisible(), asy
     }
 
     const { rows } = await query(
-      `UPDATE employees
-          SET manager_id    = $2,
-              org_title     = COALESCE($3, org_title),
-              sibling_order = COALESCE($4,
-                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
-        WHERE id = $1
-        RETURNING id, full_name, manager_id, org_title, sibling_order`,
+      Q_REPARENT,
       [
         id,
         manager_id,
@@ -639,16 +845,7 @@ router.put('/:id/cv', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (employee_id) DO UPDATE
-           SET headline = EXCLUDED.headline,
-               summary = EXCLUDED.summary,
-               phone = EXCLUDED.phone,
-               location_text = EXCLUDED.location_text,
-               linkedin_url = EXCLUDED.linkedin_url
-         RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
-                   verification_status`,
+        Q_UPSERT_CV,
         [
           id,
           headline || null,
@@ -683,10 +880,7 @@ router.post('/:id/experience', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_experience
-           (employee_id, title, organization, start_date, end_date, description, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))
-         RETURNING ${EXPERIENCE_COLUMNS}`,
+        Q_INSERT_EXPERIENCE,
         [
           id,
           title.trim(),
@@ -718,11 +912,7 @@ router.put('/:id/experience/:expId', requireSelfOrAdmin(), async (req, res, next
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `UPDATE employee_experience
-            SET title = $3, organization = $4, start_date = $5, end_date = $6,
-                description = $7, sort_order = COALESCE($8, sort_order)
-          WHERE id = $1 AND employee_id = $2
-          RETURNING ${EXPERIENCE_COLUMNS}`,
+        Q_UPDATE_EXPERIENCE,
         [
           expId,
           id,
@@ -782,10 +972,7 @@ router.post('/:id/education', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_education
-           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))
-         RETURNING ${EDUCATION_COLUMNS}`,
+        Q_INSERT_EDUCATION,
         [
           id,
           degree.trim(),
@@ -819,11 +1006,7 @@ router.put('/:id/education/:eduId', requireSelfOrAdmin(), async (req, res, next)
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `UPDATE employee_education
-            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
-                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
-          WHERE id = $1 AND employee_id = $2
-          RETURNING ${EDUCATION_COLUMNS}`,
+        Q_UPDATE_EDUCATION,
         [
           eduId,
           id,
@@ -894,9 +1077,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
 
       if (!resolvedId) {
         const name = skill_name.trim();
-        const existing = await client.query('SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1', [
-          name,
-        ]);
+        const existing = await client.query(Q_FIND_SKILL_BY_NAME, [name]);
         if (existing.rows.length) {
           resolvedId = existing.rows[0].id;
         } else {
@@ -920,9 +1101,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
 
           const code = await uniqueSkillCode(client, name);
           const inserted = await client.query(
-            `INSERT INTO skills (code, name, description, category_id)
-             VALUES ($1, $2, 'Added from an employee profile', $3)
-             RETURNING id`,
+            Q_INSERT_SKILL_MINIMAL,
             [code, name, category_id]
           );
           resolvedId = inserted.rows[0].id;
@@ -934,9 +1113,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
       }
 
       await client.query(
-        `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
-         VALUES ($1,$2,$3)
-         ON CONFLICT (employee_id, skill_id) DO NOTHING`,
+        Q_ASSIGN_SKILL,
         [id, resolvedId, req.user.employee_id]
       );
 
@@ -971,10 +1148,7 @@ router.delete('/:id/skills/:skillId', requireSelfOrAdmin(), async (req, res, nex
 
     const outcome = await withTransaction(async (client) => {
       const others = await client.query(
-        `SELECT 1 FROM skill_assessments
-          WHERE employee_id = $1 AND skill_id = $2
-            AND assessor_type IN ('Manager','Mentor','SME')
-          LIMIT 1`,
+        Q_HAS_OTHER_ASSESSMENT,
         [id, skillId]
       );
       if (others.rows.length) return 'assessed';
@@ -1024,7 +1198,7 @@ router.post('/:id/photo', requireSelfOrAdmin(), uploadPhoto, async (req, res, ne
     const publicUrl = await uploadPublicFile(path, req.file.buffer, req.file.mimetype);
 
     const { rows } = await query(
-      'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
+      Q_SET_PHOTO,
       [id, publicUrl]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
@@ -1048,7 +1222,7 @@ router.delete('/:id/photo', requireSelfOrAdmin(), async (req, res, next) => {
     await removePublicFolder(`${id}/`);
 
     const { rows } = await query(
-      'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
+      Q_CLEAR_PHOTO,
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });

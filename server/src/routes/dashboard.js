@@ -6,10 +6,21 @@
 // about exactly one person — themselves. That falls out of the same predicate
 // the rest of the API uses rather than being a separate set of rules.
 const express = require('express');
-const { query } = require('../db');
+const { query, sql } = require('../db');
 const { visibleIdsSql, isAdmin } = require('../lib/visibility');
 
 const router = express.Router();
+
+// GREATEST() only arrived in SQL Server 2022, and the target is stated as
+// 2019/2022 — so it has to be a CASE expression rather than a token swap.
+const AVG_GAP = sql({
+  pg: 'ROUND(AVG(GREATEST(COALESCE(b.required_level,0) - COALESCE(m.effective_level,0), 0)), 2)',
+  mssql: `ROUND(AVG(CAST(
+                CASE WHEN COALESCE(b.required_level,0) - COALESCE(m.effective_level,0) > 0
+                     THEN COALESCE(b.required_level,0) - COALESCE(m.effective_level,0)
+                     ELSE 0 END AS decimal(10,2))), 2)`,
+});
+
 
 // GET /api/dashboard/executive
 router.get('/executive', async (req, res, next) => {
@@ -41,7 +52,7 @@ router.get('/executive', async (req, res, next) => {
       `SELECT sc.name AS skill_area,
               d.code AS department_code,
               d.name AS department_name,
-              ROUND(AVG(GREATEST(COALESCE(b.required_level,0) - COALESCE(m.effective_level,0), 0)), 2) AS avg_gap,
+              ${AVG_GAP} AS avg_gap,
               ROUND(AVG(COALESCE(m.effective_level,0)), 2) AS avg_level
        FROM skill_categories sc
        JOIN skills s ON s.category_id = sc.id

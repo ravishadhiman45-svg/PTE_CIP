@@ -2,10 +2,40 @@
 // Derives current vs required capability per skill area for 2026 / 2028 / 2032
 // from each category's average assessed level and future_relevance.
 const express = require('express');
-const { query } = require('../db');
+const { query, sql } = require('../db');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------
+// Dialect-divergent SQL — see server/src/db/sql.js
+// ---------------------------------------------------------------
+
+// MODE() WITHIN GROUP is a Postgres ordered-set aggregate with no T-SQL
+// counterpart at all. The equivalent is "the most common value in the group",
+// which becomes a correlated TOP 1 ... GROUP BY ... ORDER BY COUNT(*) DESC.
+//
+// The tie-break differs: Postgres's MODE() picks an arbitrary winner among
+// equally-frequent values, so the secondary ORDER BY here makes the T-SQL
+// version DETERMINISTIC rather than merely matching. That is a deliberate
+// improvement, not an accident — but it means the two can legitimately disagree
+// on a tie, which is worth knowing when diffing outputs.
+const DOMINANT_RELEVANCE = sql({
+  pg: 'MODE() WITHIN GROUP (ORDER BY s.future_relevance)',
+  mssql: `(SELECT TOP 1 s2.future_relevance
+                 FROM skills s2
+                WHERE s2.category_id = sc.id AND s2.future_relevance IS NOT NULL
+                GROUP BY s2.future_relevance
+                ORDER BY COUNT(*) DESC, s2.future_relevance)`,
+});
+
+// BOOL_OR(p) -> MAX(CASE WHEN p THEN 1 ELSE 0 END), compared to produce a real
+// boolean so the JSON stays true/false rather than 1/0.
+const IS_STRATEGIC = sql({
+  pg: "BOOL_OR(s.criticality IN ('High','Critical'))",
+  mssql: `CAST(MAX(CASE WHEN s.criticality IN ('High','Critical') THEN 1 ELSE 0 END) AS bit)`,
+});
+
 
 // future_relevance → target capability (%) by horizon.
 const REQUIRED_BY_RELEVANCE = {
@@ -25,8 +55,8 @@ router.get('/', async (req, res, next) => {
     const { rows } = await query(
       `SELECT sc.name AS skill_area,
               ROUND(AVG(COALESCE(m.effective_level,0)), 2) AS avg_level,
-              MODE() WITHIN GROUP (ORDER BY s.future_relevance) AS future_relevance,
-              BOOL_OR(s.criticality IN ('High','Critical')) AS strategic
+              ${DOMINANT_RELEVANCE} AS future_relevance,
+              ${IS_STRATEGIC} AS strategic
        FROM skill_categories sc
        JOIN skills s ON s.category_id = sc.id
        LEFT JOIN v_employee_skill_matrix m

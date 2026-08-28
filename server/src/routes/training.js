@@ -1,8 +1,69 @@
 // Training catalog.
 const express = require('express');
-const { query } = require('../db');
+const { query, sql } = require('../db');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------
+// Dialect-divergent SQL — see server/src/db/sql.js
+// ---------------------------------------------------------------
+
+// A course's skill names as a JSON array. As in routes/skills.js, T-SQL builds
+// it with a correlated FOR JSON PATH rather than aggregating the join fan-out.
+//
+// The shapes differ: pg parses json into an array of strings, while FOR JSON
+// PATH yields objects. Requesting a single unnamed column and using
+// WITHOUT_ARRAY_WRAPPER would give a bare string, so the mssql branch keeps the
+// {name} objects and parseSkillNames() flattens them.
+const COURSE_SKILLS_JSON = sql({
+  pg: `COALESCE(
+                JSON_AGG(DISTINCT s.name) FILTER (WHERE s.id IS NOT NULL), '[]'
+              ) AS skills`,
+  mssql: `COALESCE((
+                SELECT DISTINCT s2.name
+                  FROM course_skill_map csm2
+                  JOIN skills s2 ON s2.id = csm2.skill_id
+                 WHERE csm2.course_id = tc.id
+                 FOR JSON PATH
+              ), '[]') AS skills`,
+});
+
+const Q_INSERT_COURSE = sql({
+  pg: `INSERT INTO training_courses
+         (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id, course_code, title`,
+  mssql: `INSERT INTO training_courses
+         (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
+       OUTPUT INSERTED.id, INSERTED.course_code, INSERTED.title
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+});
+
+// Flattens the skills column to a string array on both dialects: pg already has
+// ["a","b"], FOR JSON PATH gives '[{"name":"a"},{"name":"b"}]'.
+function parseSkillNames(rows) {
+  for (const row of rows) {
+    const v = row.skills;
+    if (Array.isArray(v)) {
+      row.skills = v.map((x) => (x && typeof x === 'object' ? x.name : x)).filter(Boolean);
+      continue;
+    }
+    if (typeof v === 'string' && v.length > 0) {
+      try {
+        const parsed = JSON.parse(v);
+        row.skills = (Array.isArray(parsed) ? parsed : [])
+          .map((x) => (x && typeof x === 'object' ? x.name : x))
+          .filter(Boolean);
+        continue;
+      } catch {
+        // fall through
+      }
+    }
+    row.skills = [];
+  }
+  return rows;
+}
+
 
 // GET /api/training?search=&type=&category=
 router.get('/', async (req, res, next) => {
@@ -33,9 +94,7 @@ router.get('/', async (req, res, next) => {
       `SELECT tc.id, tc.course_code, tc.title, tc.description, tc.course_type,
               tc.delivery_mode, tc.duration_hours, tc.difficulty, tc.status,
               sme.full_name AS owner_sme, coord.full_name AS coordinator,
-              COALESCE(
-                JSON_AGG(DISTINCT s.name) FILTER (WHERE s.id IS NOT NULL), '[]'
-              ) AS skills
+              ${COURSE_SKILLS_JSON}
        FROM training_courses tc
        LEFT JOIN employees sme ON sme.id = tc.owner_sme_id
        LEFT JOIN employees coord ON coord.id = tc.coordinator_id
@@ -48,7 +107,7 @@ router.get('/', async (req, res, next) => {
        ORDER BY tc.title`,
       params
     );
-    res.json(rows);
+    res.json(parseSkillNames(rows));
   } catch (err) {
     next(err);
   }
@@ -97,10 +156,7 @@ router.post('/', async (req, res, next) => {
         .json({ error: 'course_code, title, course_type and delivery_mode are required' });
     }
     const { rows } = await query(
-      `INSERT INTO training_courses
-         (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING id, course_code, title`,
+      Q_INSERT_COURSE,
       [course_code, title, description || null, course_type, delivery_mode, duration_hours || null, difficulty || null]
     );
     res.status(201).json(rows[0]);
