@@ -116,7 +116,7 @@ async function main() {
   console.log(`[startup] dialect=${db.dialect} storage=${storage.driver}`);
 
   app.listen(PORT, () => {
-    console.log(`PTE CIP API listening on http://localhost:${PORT}`);
+    console.log(`PTE CIP API listening on port ${PORT}`);
   });
 }
 
