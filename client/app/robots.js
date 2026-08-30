@@ -19,7 +19,7 @@ export default function robots() {
           '/roles',
           '/assessments',
           '/training',
-          '/learning-plan',
+          '/learning-module',
           '/certifications',
           '/mentor',
           '/roadmap',

@@ -524,21 +524,26 @@ async function loadProfile(id) {
     [id]
   );
 
-  // Courses still running, each with its module list. The modules ride along
-  // instead of lazy-loading from GET /api/training/:id when a row is expanded:
-  // this profile is one payload by design, and three small columns per module
-  // for at most a dozen courses is smaller than the experience section already
-  // in here.
+  // Courses still running, each with its module list and which modules are
+  // actually done. completed_at comes from enrollment_module_progress, so the
+  // ticks are a record rather than the estimate this used to derive from the
+  // course percentage. Ticking happens on the Learning Module page; the profile
+  // only reads it.
   const enrollmentsP = query(
     `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
             tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
             COALESCE((
               SELECT json_agg(json_build_object(
+                       'id',               cm.id,
                        'module_order',     cm.module_order,
                        'module_title',     cm.module_title,
-                       'duration_minutes', cm.duration_minutes)
+                       'duration_minutes', cm.duration_minutes,
+                       'completed_at',     emp.completed_at)
                      ORDER BY cm.module_order)
-              FROM course_modules cm WHERE cm.course_id = tc.id
+              FROM course_modules cm
+              LEFT JOIN enrollment_module_progress emp
+                     ON emp.module_id = cm.id AND emp.enrollment_id = te.id
+              WHERE cm.course_id = tc.id
             ), '[]'::json) AS modules
      FROM training_enrollments te
      JOIN training_courses tc ON tc.id = te.course_id

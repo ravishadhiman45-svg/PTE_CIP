@@ -14,7 +14,7 @@ const TITLES = [
   ['/roles', 'Roles / Careers'],
   ['/assessments', 'Assessments'],
   ['/training', 'Training Catalog'],
-  ['/learning-plan', 'Learning Plan — My Plan'],
+  ['/learning-module', 'Learning Module'],
   ['/certifications', 'Certification Tracker'],
   ['/mentor', 'Mentor Dashboard'],
   ['/roadmap', 'Future Skills Roadmap'],

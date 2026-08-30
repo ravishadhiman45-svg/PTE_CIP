@@ -35,7 +35,7 @@ export const NAV_ITEMS = [
     roles: ['admin', 'manager', 'department_head', 'executive', 'mentor', 'sme'],
   },
   { label: 'Training', href: '/training', icon: GraduationCap, roles: [] },
-  { label: 'Learning Plan', href: '/learning-plan', icon: KanbanSquare, roles: [] },
+  { label: 'Learning Module', href: '/learning-module', icon: KanbanSquare, roles: [] },
   { label: 'Certifications', href: '/certifications', icon: BadgeCheck, roles: [] },
   {
     label: 'Mentors & SMEs',

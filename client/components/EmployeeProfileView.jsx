@@ -20,9 +20,9 @@ import { useAuth } from '@/components/AuthProvider';
 import ProfileEditModal from '@/components/ProfileEditModal';
 import SelfSkillModal from '@/components/SelfSkillModal';
 import RequestVerificationModal from '@/components/RequestVerificationModal';
-import LearningModuleTab from '@/components/LearningModuleTab';
+import LearningJourneyTab from '@/components/LearningJourneyTab';
 
-const TABS = ['Summary', 'Skills Passport', 'Learning Module', 'Mentor Notes'];
+const TABS = ['Summary', 'Skills Passport', 'Learning Journey', 'Mentor Notes'];
 
 // Full employee profile UI, driven by an employeeId. Shared by /employees/[id]
 // (viewing anyone) and /profile (the logged-in user's own profile).
@@ -436,7 +436,7 @@ export default function EmployeeProfileView({ employeeId }) {
                   <h3 className="text-base font-semibold text-white">Recent Learning</h3>
                   <button
                     className="text-xs text-accent-soft hover:underline"
-                    onClick={() => setTab('Learning Module')}
+                    onClick={() => setTab('Learning Journey')}
                   >
                     View all →
                   </button>
@@ -525,8 +525,8 @@ export default function EmployeeProfileView({ employeeId }) {
         </Card>
       ) : null}
 
-      {tab === 'Learning Module' ? (
-        <LearningModuleTab
+      {tab === 'Learning Journey' ? (
+        <LearningJourneyTab
           employeeId={employeeId}
           canEdit={canEdit}
           stats={learningStats}

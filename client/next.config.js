@@ -1,6 +1,12 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // The Kanban board used to live at /learning-plan. It is now one section of
+  // the wider Learning Module page, so keep the old path working rather than
+  // 404ing anyone's bookmark.
+  async redirects() {
+    return [{ source: '/learning-plan', destination: '/learning-module', permanent: false }];
+  },
   // Google Identity Services opens a popup and posts the credential back to this
   // window. The browser's default COOP blocks that postMessage, so opt into the
   // one value GSI needs — strict enough to isolate us from unrelated origins,
