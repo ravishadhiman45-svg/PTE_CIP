@@ -1,7 +1,7 @@
 -- =============================================================
 -- PTE CIP — PER-MODULE PROGRESS (Learning Module page)
 -- Additive migration. Safe to re-run (idempotent).
--- Run in the Supabase SQL Editor after 12_learning_module.sql.
+-- Run in the Supabase SQL Editor after 13_learning_module.sql.
 --
 -- course_modules has always held the module breakdown of every course, but
 -- nothing recorded which of them a person had actually done: training_enrollments

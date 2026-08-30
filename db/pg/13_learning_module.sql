@@ -1,7 +1,7 @@
 -- =============================================================
 -- PTE CIP — LEARNING MODULE (profile tab)
 -- Additive migration. Safe to re-run (idempotent).
--- Run this in the Supabase SQL Editor after 11_skill_taxonomy_backfill.sql.
+-- Run this in the Supabase SQL Editor after 12_tree_sort_key.sql.
 --
 -- Makes employee_certifications the single list behind the profile's Learning
 -- Module tab. A row either points at the internal `certifications` catalogue —

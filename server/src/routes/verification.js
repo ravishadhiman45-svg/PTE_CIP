@@ -11,9 +11,50 @@
 // employee, who has none. Verification now goes UP the chain instead, which is
 // also the direction it means something.
 const express = require('express');
-const { query, pool } = require('../db');
+const { query, withTransaction, sql } = require('../db');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------
+// Dialect-divergent SQL — see server/src/db/sql.js
+// ---------------------------------------------------------------
+
+// UPDLOCK/HOLDLOCK on the existence check makes this atomic, which is what
+// ON CONFLICT DO NOTHING gives for free. Without the hint two concurrent
+// callers can both see "absent" and one then hits a primary-key violation.
+const Q_ENSURE_CV = sql({
+  pg: 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
+  mssql: `INSERT INTO employee_cv (employee_id)
+          SELECT $1 WHERE NOT EXISTS (
+            SELECT 1 FROM employee_cv WITH (UPDLOCK, HOLDLOCK) WHERE employee_id = $1)`,
+});
+
+// Note $2 appears TWICE — as requested_by and as entity_id. Named parameters
+// make that free on SQL Server; a positional `?` conversion would have needed
+// the value duplicated in the params array.
+const Q_INSERT_APPROVAL = sql({
+  pg: `INSERT INTO approvals
+           (approval_type, requested_by, approver_id, entity_type, entity_id, status)
+         VALUES ($1,$2,$3,'employee_cv',$2,'Pending')
+         RETURNING id, approval_type, status, requested_at`,
+  mssql: `INSERT INTO approvals
+           (approval_type, requested_by, approver_id, entity_type, entity_id, status)
+         OUTPUT INSERTED.id, INSERTED.approval_type, INSERTED.status, INSERTED.requested_at
+         VALUES ($1,$2,$3,'employee_cv',$2,'Pending')`,
+});
+
+const Q_DECIDE_APPROVAL = sql({
+  pg: `UPDATE approvals
+            SET status = $2, decision_comments = COALESCE($3, decision_comments), decided_at = NOW()
+          WHERE id = $1
+          RETURNING id, approval_type, status, decision_comments, decided_at`,
+  mssql: `UPDATE approvals
+            SET status = $2, decision_comments = COALESCE($3, decision_comments), decided_at = SYSUTCDATETIME()
+          OUTPUT INSERTED.id, INSERTED.approval_type, INSERTED.status,
+                 INSERTED.decision_comments, INSERTED.decided_at
+          WHERE id = $1`,
+});
+
 
 const APPROVAL_TYPE = 'Profile Verification';
 
@@ -47,21 +88,6 @@ router.get('/approvers', async (req, res, next) => {
   }
 });
 
-async function withTransaction(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
 // POST /api/verification/request  { approver_employee_id, message? }
 router.post('/request', async (req, res, next) => {
   try {
@@ -94,7 +120,7 @@ router.post('/request', async (req, res, next) => {
       );
 
       await client.query(
-        'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
+        Q_ENSURE_CV,
         [me]
       );
       await client.query(
@@ -105,10 +131,7 @@ router.post('/request', async (req, res, next) => {
       );
 
       const inserted = await client.query(
-        `INSERT INTO approvals
-           (approval_type, requested_by, approver_id, entity_type, entity_id, status)
-         VALUES ($1,$2,$3,'employee_cv',$2,'Pending')
-         RETURNING id, approval_type, status, requested_at`,
+        Q_INSERT_APPROVAL,
         [APPROVAL_TYPE, me, approver_employee_id]
       );
       const row = inserted.rows[0];
@@ -167,16 +190,13 @@ router.post('/:id/decision', async (req, res, next) => {
 
     const updated = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `UPDATE approvals
-            SET status = $2, decision_comments = COALESCE($3, decision_comments), decided_at = NOW()
-          WHERE id = $1
-          RETURNING id, approval_type, status, decision_comments, decided_at`,
+        Q_DECIDE_APPROVAL,
         [approval.id, decision, comments || null]
       );
 
       if (approval.approval_type === APPROVAL_TYPE) {
         await client.query(
-          'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
+          Q_ENSURE_CV,
           [approval.entity_id]
         );
         await client.query(

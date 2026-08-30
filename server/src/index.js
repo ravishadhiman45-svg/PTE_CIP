@@ -5,6 +5,8 @@ const express = require('express');
 const cors = require('cors');
 
 const { requireAuth } = require('./middleware/auth');
+const db = require('./db');
+const storage = require('./storage');
 
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
@@ -35,8 +37,32 @@ app.use(
 );
 app.use(express.json());
 
-// Health check (public).
-app.get('/api/health', (req, res) => res.json({ ok: true, service: 'ptecip-api' }));
+// Profile images, when they live on this machine's disk rather than in a hosted
+// bucket. Public on purpose: these URLs are stored in employees.photo_url and
+// rendered straight into an <img src>, exactly as the bucket's public URLs were.
+//
+// `immutable` is safe because the object key is timestamped on every upload
+// (routes/employees.js:990) — a changed picture is a changed URL, never a
+// changed body at the same URL.
+if (storage.driver === 'localDisk') {
+  app.use(
+    '/files',
+    express.static(storage.UPLOAD_DIR, {
+      maxAge: '1y',
+      immutable: true,
+      index: false,
+      // Never serve a directory listing or a dotfile out of the upload tree.
+      dotfiles: 'ignore',
+      redirect: false,
+    })
+  );
+}
+
+// Health check (public). Reports the resolved dialect and storage driver so an
+// on-premise deployment can be verified without shell access to the box.
+app.get('/api/health', (req, res) =>
+  res.json({ ok: true, service: 'ptecip-api', dialect: db.dialect, storage: storage.driver })
+);
 
 // Auth (public).
 app.use('/api/auth', authRoutes);
@@ -70,6 +96,28 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`PTE CIP API listening on http://localhost:${PORT}`);
-});
+
+// Verify the database before binding a port.
+//
+// The self-test exercises the three things most likely to be wrong on a fresh
+// on-premise install, in the order they would fail: the connection, boolean and
+// uuid parameter round-tripping, and whether the DDL was ever loaded (the
+// visibility function exists). Discovering any of those from a 500 on request
+// forty is much worse than refusing to start.
+async function main() {
+  try {
+    await db.selfTest();
+  } catch (err) {
+    console.error(`[startup] database check failed (dialect=${db.dialect})`);
+    console.error(err.message);
+    process.exit(1);
+  }
+
+  console.log(`[startup] dialect=${db.dialect} storage=${storage.driver}`);
+
+  app.listen(PORT, () => {
+    console.log(`PTE CIP API listening on http://localhost:${PORT}`);
+  });
+}
+
+main();

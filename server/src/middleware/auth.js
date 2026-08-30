@@ -2,7 +2,19 @@
 const jwt = require('jsonwebtoken');
 const { canView } = require('../lib/visibility');
 
+// A missing JWT_SECRET used to fall back to the literal 'dev-secret'. That is
+// fine on a laptop and catastrophic anywhere else: the fallback is a known
+// constant, so anyone who can read this file can mint a valid admin token. It is
+// also exactly the kind of variable that gets forgotten when handing a build to
+// a client, so production refuses to start without it.
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+if (!process.env.JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('[auth] JWT_SECRET must be set in production — refusing to start');
+  }
+  console.warn('[auth] JWT_SECRET is not set; using the insecure development default');
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

@@ -1,9 +1,36 @@
 // Job roles list + role detail (mandatory skills + people readiness).
 const express = require('express');
-const { query } = require('../db');
+const { query, sql } = require('../db');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------
+// Dialect-divergent SQL — see server/src/db/sql.js
+// ---------------------------------------------------------------
+
+// COUNT(*) FILTER (WHERE p) -> COUNT(CASE WHEN p THEN 1 END).
+//
+// The CASE form works on Postgres too, but FILTER is the clearer idiom there
+// and this keeps the pg branch byte-identical to what shipped.
+const READINESS_BUCKETS = sql({
+  pg: `COUNT(*) FILTER (WHERE readiness_percent >= 100) AS ready_now,
+         COUNT(*) FILTER (WHERE readiness_percent >= 75 AND readiness_percent < 100) AS ready_3m,
+         COUNT(*) FILTER (WHERE readiness_percent >= 50 AND readiness_percent < 75) AS ready_6m,
+         COUNT(*) FILTER (WHERE readiness_percent < 50) AS not_ready,`,
+  mssql: `COUNT(CASE WHEN readiness_percent >= 100 THEN 1 END) AS ready_now,
+         COUNT(CASE WHEN readiness_percent >= 75 AND readiness_percent < 100 THEN 1 END) AS ready_3m,
+         COUNT(CASE WHEN readiness_percent >= 50 AND readiness_percent < 75 THEN 1 END) AS ready_6m,
+         COUNT(CASE WHEN readiness_percent < 50 THEN 1 END) AS not_ready,`,
+});
+
+// COUNT(e.id) FILTER (...) counts non-null e.id among matching rows, so the CASE
+// must yield e.id — not 1 — or an outer-joined miss would be counted.
+const MEETING_COUNT = sql({
+  pg: 'COUNT(e.id) FILTER (WHERE COALESCE(m.effective_level, 0) >= b.required_level)',
+  mssql: 'COUNT(CASE WHEN COALESCE(m.effective_level, 0) >= b.required_level THEN e.id END)',
+});
+
 
 // GET /api/roles
 //
@@ -22,7 +49,8 @@ router.get('/', async (req, res, next) => {
        FROM job_roles jr
        LEFT JOIN job_role_skill_benchmarks b ON b.job_role_id = jr.id
        LEFT JOIN employees e ON e.job_role_id = jr.id AND e.id IN (${scope})
-       GROUP BY jr.id
+       GROUP BY jr.id, jr.code, jr.role_name, jr.role_family, jr.function_area,
+                jr.role_level, jr.criticality, jr.is_future_role
        ORDER BY jr.role_name`,
       params
     );
@@ -54,10 +82,7 @@ router.get('/:id', async (req, res, next) => {
     const readinessParams = [id];
     const readinessP = query(
       `SELECT
-         COUNT(*) FILTER (WHERE readiness_percent >= 100) AS ready_now,
-         COUNT(*) FILTER (WHERE readiness_percent >= 75 AND readiness_percent < 100) AS ready_3m,
-         COUNT(*) FILTER (WHERE readiness_percent >= 50 AND readiness_percent < 75) AS ready_6m,
-         COUNT(*) FILTER (WHERE readiness_percent < 50) AS not_ready,
+         ${READINESS_BUCKETS}
          COUNT(*) AS total,
          ROUND(AVG(readiness_percent), 1) AS avg_readiness
        FROM v_role_readiness
@@ -86,7 +111,7 @@ router.get('/:id', async (req, res, next) => {
     const gapsP = query(
       `SELECT s.id AS skill_id, s.name AS skill_name, b.required_level, b.priority,
               ROUND(AVG(COALESCE(m.effective_level, 0)), 1) AS avg_level,
-              COUNT(e.id) FILTER (WHERE COALESCE(m.effective_level, 0) >= b.required_level) AS meeting,
+              ${MEETING_COUNT} AS meeting,
               COUNT(e.id) AS people
        FROM job_role_skill_benchmarks b
        JOIN skills s ON s.id = b.skill_id

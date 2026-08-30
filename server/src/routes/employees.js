@@ -2,12 +2,19 @@
 // and the self-service CV editing endpoints.
 const express = require('express');
 const multer = require('multer');
-const { query, pool } = require('../db');
+const { query, withTransaction, sql, isUniqueViolation, isReportingCycle } = require('../db');
 const { requireRole, requireSelfOrAdmin, requireVisible } = require('../middleware/auth');
 const { visibleIdsSql, canView, managerChain } = require('../lib/visibility');
 const { streamCvPdf, cvFileName } = require('../lib/cvPdf');
-const { uploadPublicFile, removePublicFolder, removePublicFiles } = require('../supabase');
+const { uploadPublicFile, removePublicFolder, removePublicFiles } = require('../storage');
 const { insertDefaultLevelDefinitions } = require('../lib/skillLevels');
+const {
+  buildTemplate,
+  readRows,
+  validateRows,
+  normalizeKey,
+  ImportError,
+} = require('../lib/employeeImport');
 
 const router = express.Router();
 
@@ -70,16 +77,403 @@ function uploadEvidence(req, res, next) {
   });
 }
 
+// The bulk-onboarding spreadsheet. Same memory-then-parse shape as the photo
+// upload; nothing is ever written to disk.
+//
+// Browsers disagree about the .xlsx mime type — Chrome sends the long
+// openxmlformats one, some Windows setups send application/octet-stream, and a
+// file dragged out of an email client can arrive as application/zip (which an
+// .xlsx genuinely is). So the extension is the gate, and the real check is
+// whether ExcelJS can parse it.
+const uploadWorkbook = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!/\.xlsx$/i.test(file.originalname || '')) {
+      return cb(new Error('Upload an .xlsx file — start from the sample template'));
+    }
+    return cb(null, true);
+  },
+});
+
+function uploadSheet(req, res, next) {
+  uploadWorkbook.single('file')(req, res, (err) => {
+    if (err) {
+      const message =
+        err.code === 'LIMIT_FILE_SIZE' ? 'The file must be smaller than 5 MB' : err.message;
+      return res.status(400).json({ error: message });
+    }
+    return next();
+  });
+}
+
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
 
+// Dates are projected as plain YYYY-MM-DD strings rather than timestamps, so the
+// client never has to reason about timezones for a date-only field.
+const EXPERIENCE_COLUMNS = sql({
+  pg: `id, title, organization,
+  to_char(start_date, 'YYYY-MM-DD') AS start_date,
+  to_char(end_date, 'YYYY-MM-DD') AS end_date,
+  description, sort_order`,
+  // CONVERT style 23 is ISO yyyy-mm-dd.
+  mssql: `id, title, organization,
+  CONVERT(varchar(10), start_date, 23) AS start_date,
+  CONVERT(varchar(10), end_date, 23) AS end_date,
+  description, sort_order`,
+});
+
+const EDUCATION_COLUMNS =
+  'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
+
+// ---------------------------------------------------------------
+// Dialect-divergent SQL
+//
+// These statements use Postgres constructs with no token-level T-SQL
+// equivalent, so each is written out per dialect. Both branches take the SAME
+// params array, and both still go through the rewriter ($n -> @pn, dbo.
+// qualification, boolean marshalling) — only the STRUCTURE is overridden.
+//
+// The T-SQL conditional inserts use WITH (UPDLOCK, HOLDLOCK) on the existence
+// check. That is the standard idiom for a race-free "insert if absent": a bare
+// NOT EXISTS lets two concurrent callers both see "absent" and one then hits a
+// primary-key violation, whereas ON CONFLICT DO NOTHING is atomic. The locking
+// hint restores the atomicity the Postgres version had.
+// ---------------------------------------------------------------
+
+const Q_ENSURE_CV = sql({
+  pg: 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
+  mssql: `INSERT INTO employee_cv (employee_id)
+          SELECT $1 WHERE NOT EXISTS (
+            SELECT 1 FROM employee_cv WITH (UPDLOCK, HOLDLOCK) WHERE employee_id = $1)`,
+});
+
+const Q_INSERT_EMPLOYEE = sql({
+  pg: `INSERT INTO employees
+         (employee_code, full_name, email, gender, grade, joining_date,
+          department_id, team_id, job_role_id, manager_id, location_id, org_title,
+          sibling_order)
+       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
+          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
+       RETURNING id, employee_code, full_name, email, org_title`,
+  // OUTPUT must go INTO a table variable here, not straight to the caller.
+  //
+  // SQL Server refuses "OUTPUT without INTO" on any table carrying an enabled
+  // trigger, and `employees` has two (trg_employees_updated_at and
+  // trg_employees_no_cycle). The error is explicit about it:
+  //   "The target table ... cannot have any enabled triggers if the statement
+  //    contains an OUTPUT clause without INTO clause."
+  // So the rows are captured into @out and selected back, which is permitted.
+  // The trailing SELECT is what the driver returns as the recordset.
+  mssql: `DECLARE @out TABLE (
+            id UNIQUEIDENTIFIER, employee_code NVARCHAR(450), full_name NVARCHAR(450),
+            email NVARCHAR(450), org_title NVARCHAR(450));
+       INSERT INTO employees
+         (employee_code, full_name, email, gender, grade, joining_date,
+          department_id, team_id, job_role_id, manager_id, location_id, org_title,
+          sibling_order)
+       OUTPUT INSERTED.id, INSERTED.employee_code, INSERTED.full_name,
+              INSERTED.email, INSERTED.org_title
+         INTO @out
+       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
+          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1));
+       SELECT id, employee_code, full_name, email, org_title FROM @out;`,
+});
+
+const Q_INSERT_APP_USER = sql({
+  pg: `INSERT INTO app_users (employee_id, email, display_name)
+       VALUES ($1,$2,$3) RETURNING id`,
+  mssql: `INSERT INTO app_users (employee_id, email, display_name)
+          OUTPUT INSERTED.id
+          VALUES ($1,$2,$3)`,
+});
+
+const Q_GRANT_DEFAULT_ROLE = sql({
+  pg: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
+       SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
+       ON CONFLICT DO NOTHING`,
+  mssql: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
+          SELECT $1, pr.id FROM app_permission_roles pr
+           WHERE pr.role_key = 'employee'
+             AND NOT EXISTS (
+               SELECT 1 FROM user_permission_role_map m WITH (UPDLOCK, HOLDLOCK)
+                WHERE m.user_id = $1 AND m.permission_role_id = pr.id)`,
+});
+
+
+// --- Scalar / projection fragments -----------------------------------------
+
+// COUNT(*) is bigint, which pg returns as a STRING. The ::int cast is what
+// makes it a JS number, and T-SQL needs the same cast for the same reason.
+const DIRECT_REPORTS_COUNT = sql({
+  pg: '(SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id)',
+  mssql: '(SELECT CAST(count(*) AS int) FROM employees c WHERE c.manager_id = e.id)',
+});
+const SUBTREE_COUNT = sql({
+  pg: '(SELECT count(*)::int FROM employee_subtree(e.id))',
+  mssql: '(SELECT CAST(count(*) AS int) FROM dbo.employee_subtree(e.id))',
+});
+
+// LIMIT 1 inside a CORRELATED SCALAR SUBQUERY — the shape the rewriter refuses
+// to touch, because relocating the token to TOP would bind it to the outer
+// SELECT and silently truncate the whole result set.
+const ACTIVE_MENTOR_NAME = sql({
+  pg: `(SELECT me.full_name FROM mentor_assignments ma
+               JOIN employees me ON me.id = ma.mentor_id
+               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
+               ORDER BY ma.start_date ASC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 me.full_name FROM mentor_assignments ma
+               JOIN employees me ON me.id = ma.mentor_id
+               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
+               ORDER BY ma.start_date ASC)`,
+});
+
+const LATEST_TARGET_ROLE = sql({
+  pg: `(SELECT jr2.role_name FROM mentor_recommendations mr
+               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
+               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
+               ORDER BY mr.submitted_at DESC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 jr2.role_name FROM mentor_recommendations mr
+               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
+               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
+               ORDER BY mr.submitted_at DESC)`,
+});
+
+const PENDING_APPROVER = sql({
+  pg: `(SELECT ap.full_name FROM approvals a
+               JOIN employees ap ON ap.id = a.approver_id
+               WHERE a.approval_type = 'Profile Verification'
+                 AND a.entity_id = e.id AND a.status = 'Pending'
+               ORDER BY a.requested_at DESC LIMIT 1)`,
+  mssql: `(SELECT TOP 1 ap.full_name FROM approvals a
+               JOIN employees ap ON ap.id = a.approver_id
+               WHERE a.approval_type = 'Profile Verification'
+                 AND a.entity_id = e.id AND a.status = 'Pending'
+               ORDER BY a.requested_at DESC)`,
+});
+
+// Projection lists reused by the OUTPUT clauses below. OUTPUT accepts
+// expressions over INSERTED columns, so the date formatting survives.
+const EXPERIENCE_OUTPUT = `INSERTED.id, INSERTED.title, INSERTED.organization,
+  CONVERT(varchar(10), INSERTED.start_date, 23) AS start_date,
+  CONVERT(varchar(10), INSERTED.end_date, 23) AS end_date,
+  INSERTED.description, INSERTED.sort_order`;
+
+const EDUCATION_OUTPUT = `INSERTED.id, INSERTED.degree, INSERTED.institution,
+  INSERTED.field_of_study, INSERTED.start_year, INSERTED.end_year,
+  INSERTED.grade, INSERTED.sort_order`;
+
+// --- Statements -------------------------------------------------------------
+
+// An outer LIMIT with an ORDER BY already present, so OFFSET/FETCH applies
+// cleanly (it requires the ORDER BY that LIMIT does not).
+const Q_RECENT_LEARNING = sql({
+  pg: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
+     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
+     LIMIT 8`,
+  mssql: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
+     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
+     OFFSET 0 ROWS FETCH NEXT 8 ROWS ONLY`,
+});
+
+const Q_REPARENT = sql({
+  pg: `UPDATE employees
+          SET manager_id    = $2,
+              org_title     = COALESCE($3, org_title),
+              sibling_order = COALESCE($4,
+                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
+        WHERE id = $1
+        RETURNING id, full_name, manager_id, org_title, sibling_order`,
+  mssql: `DECLARE @out TABLE (
+            id UNIQUEIDENTIFIER, full_name NVARCHAR(450), manager_id UNIQUEIDENTIFIER,
+            org_title NVARCHAR(450), sibling_order INT);
+        UPDATE employees
+          SET manager_id    = $2,
+              org_title     = COALESCE($3, org_title),
+              sibling_order = COALESCE($4,
+                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
+        OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.manager_id,
+               INSERTED.org_title, INSERTED.sibling_order
+          INTO @out
+        WHERE id = $1;
+        SELECT id, full_name, manager_id, org_title, sibling_order FROM @out;`,
+});
+
+// The only true UPSERT in the codebase, so the only place MERGE is warranted.
+//
+// WITH (HOLDLOCK) is required, not decorative: without it MERGE can raise a
+// duplicate-key error under concurrency, because the match test and the insert
+// are not serialised. This is the documented fix and it restores the atomicity
+// ON CONFLICT DO UPDATE has by construction.
+//
+// MERGE must be terminated by a semicolon.
+const Q_UPSERT_CV = sql({
+  pg: `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (employee_id) DO UPDATE
+           SET headline = EXCLUDED.headline,
+               summary = EXCLUDED.summary,
+               phone = EXCLUDED.phone,
+               location_text = EXCLUDED.location_text,
+               linkedin_url = EXCLUDED.linkedin_url
+         RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
+                   verification_status`,
+  mssql: `DECLARE @out TABLE (
+            employee_id UNIQUEIDENTIFIER, headline NVARCHAR(MAX), summary NVARCHAR(MAX),
+            phone NVARCHAR(450), location_text NVARCHAR(450), linkedin_url NVARCHAR(450),
+            verification_status NVARCHAR(450));
+          MERGE employee_cv WITH (HOLDLOCK) AS t
+          USING (SELECT $1 AS employee_id) AS s ON t.employee_id = s.employee_id
+          WHEN MATCHED THEN UPDATE
+            SET headline = $2, summary = $3, phone = $4,
+                location_text = $5, linkedin_url = $6
+          WHEN NOT MATCHED THEN
+            INSERT (employee_id, headline, summary, phone, location_text, linkedin_url)
+            VALUES ($1,$2,$3,$4,$5,$6)
+          OUTPUT INSERTED.employee_id, INSERTED.headline, INSERTED.summary, INSERTED.phone,
+                 INSERTED.location_text, INSERTED.linkedin_url, INSERTED.verification_status
+            INTO @out;
+          SELECT employee_id, headline, summary, phone, location_text, linkedin_url,
+                 verification_status FROM @out;`,
+});
+
+const Q_INSERT_EXPERIENCE = sql({
+  pg: `INSERT INTO employee_experience
+           (employee_id, title, organization, start_date, end_date, description, sort_order)
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))
+         RETURNING ${EXPERIENCE_COLUMNS}`,
+  mssql: `INSERT INTO employee_experience
+           (employee_id, title, organization, start_date, end_date, description, sort_order)
+         OUTPUT ${EXPERIENCE_OUTPUT}
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))`,
+});
+
+const Q_UPDATE_EXPERIENCE = sql({
+  pg: `UPDATE employee_experience
+            SET title = $3, organization = $4, start_date = $5, end_date = $6,
+                description = $7, sort_order = COALESCE($8, sort_order)
+          WHERE id = $1 AND employee_id = $2
+          RETURNING ${EXPERIENCE_COLUMNS}`,
+  mssql: `UPDATE employee_experience
+            SET title = $3, organization = $4, start_date = $5, end_date = $6,
+                description = $7, sort_order = COALESCE($8, sort_order)
+          OUTPUT ${EXPERIENCE_OUTPUT}
+          WHERE id = $1 AND employee_id = $2`,
+});
+
+const Q_INSERT_EDUCATION = sql({
+  pg: `INSERT INTO employee_education
+           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))
+         RETURNING ${EDUCATION_COLUMNS}`,
+  mssql: `INSERT INTO employee_education
+           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
+         OUTPUT ${EDUCATION_OUTPUT}
+         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))`,
+});
+
+const Q_UPDATE_EDUCATION = sql({
+  pg: `UPDATE employee_education
+            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
+                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
+          WHERE id = $1 AND employee_id = $2
+          RETURNING ${EDUCATION_COLUMNS}`,
+  mssql: `UPDATE employee_education
+            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
+                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
+          OUTPUT ${EDUCATION_OUTPUT}
+          WHERE id = $1 AND employee_id = $2`,
+});
+
+// No ORDER BY here, so TOP rather than OFFSET/FETCH.
+const Q_FIND_SKILL_BY_NAME = sql({
+  pg: 'SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1',
+  mssql: 'SELECT TOP 1 id FROM skills WHERE name LIKE $1',
+});
+
+const Q_INSERT_SKILL_MINIMAL = sql({
+  pg: `INSERT INTO skills (code, name, description, category_id)
+             VALUES ($1, $2, 'Added from an employee profile', $3)
+             RETURNING id`,
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER);
+           INSERT INTO skills (code, name, description, category_id)
+             OUTPUT INSERTED.id INTO @out
+             VALUES ($1, $2, 'Added from an employee profile', $3);
+           SELECT id FROM @out;`,
+});
+
+const Q_ASSIGN_SKILL = sql({
+  pg: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (employee_id, skill_id) DO NOTHING`,
+  mssql: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
+         SELECT $1,$2,$3 WHERE NOT EXISTS (
+           SELECT 1 FROM employee_skill_assignments WITH (UPDLOCK, HOLDLOCK)
+            WHERE employee_id = $1 AND skill_id = $2)`,
+});
+
+const Q_HAS_OTHER_ASSESSMENT = sql({
+  pg: `SELECT 1 FROM skill_assessments
+          WHERE employee_id = $1 AND skill_id = $2
+            AND assessor_type IN ('Manager','Mentor','SME')
+          LIMIT 1`,
+  mssql: `SELECT TOP 1 1 FROM skill_assessments
+          WHERE employee_id = $1 AND skill_id = $2
+            AND assessor_type IN ('Manager','Mentor','SME')`,
+});
+
+// Direct reports — the DOWN side of the record, always full-record visible
+// because anyone you can see has a subtree contained in your own.
+//
+// Postgres selects EXISTS(...) directly, since it is a boolean expression there.
+// T-SQL has no boolean expression type — EXISTS is only ever a predicate — so
+// the projection needs a CASE, cast to bit so the driver still returns a real
+// JS boolean and the API response shape is unchanged.
+const Q_DIRECT_REPORTS = sql({
+  pg: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
+            jr.role_name AS job_role,
+            EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id) AS has_reports
+     FROM employees e
+     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+     WHERE e.manager_id = $1
+     ORDER BY e.sibling_order, e.full_name`,
+  mssql: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
+            jr.role_name AS job_role,
+            CAST(CASE WHEN EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id)
+                      THEN 1 ELSE 0 END AS bit) AS has_reports
+     FROM employees e
+     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+     WHERE e.manager_id = $1
+     ORDER BY e.sibling_order, e.full_name`,
+});
+
+const Q_SET_PHOTO = sql({
+  pg: 'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
+          UPDATE employees SET photo_url = $2
+          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
+          WHERE id = $1;
+          SELECT id, photo_url FROM @out;`,
+});
+
+const Q_CLEAR_PHOTO = sql({
+  pg: 'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
+  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
+          UPDATE employees SET photo_url = NULL
+          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
+          WHERE id = $1;
+          SELECT id, photo_url FROM @out;`,
+});
+
 // Make sure the 1:1 CV row exists before updating it.
 function ensureCv(client, employeeId) {
-  return client.query(
-    'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
-    [employeeId]
-  );
+  return client.query(Q_ENSURE_CV, [employeeId]);
 }
 
 // Any CV edit invalidates a previous verification: back to Draft, and any
@@ -99,419 +493,15 @@ async function resetVerification(client, employeeId) {
   );
 }
 
-// Runs fn(client) inside a transaction.
-async function withTransaction(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-const EXPERIENCE_COLUMNS = `id, title, organization,
-  to_char(start_date, 'YYYY-MM-DD') AS start_date,
-  to_char(end_date, 'YYYY-MM-DD') AS end_date,
-  description, sort_order`;
-
-const EDUCATION_COLUMNS =
-  'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
-
-// One projection for certifications, used by the profile payload AND re-read
-// after every write: RETURNING cannot reach the joined catalogue title or the
-// approver's name, so writes select through this instead. That is what keeps the
-// object shape identical everywhere the client sees a certification.
+// Whole-history counts for the Learning Module stat row.
 //
-// LEFT JOIN, not an inner one: a free-form row has no catalogue entry, and an
-// inner join would silently drop exactly the rows this list exists to show.
-//
-// Dates go out as 'YYYY-MM-DD' strings for the same reason EXPERIENCE_COLUMNS
-// does it — they land straight in an <input type="date">, and a Date round-trip
-// through JSON shifts the day across a timezone.
-const CERTIFICATION_SELECT = `
-  SELECT ec.id, ec.certification_id, ec.source, ec.status,
-         COALESCE(c.title, ec.title_text) AS title,
-         ec.title_text, ec.issuer, ec.technology, ec.institution,
-         ec.credential_id, ec.credential_url, ec.hours, ec.notes,
-         to_char(ec.issued_date, 'YYYY-MM-DD') AS issued_date,
-         to_char(ec.expiry_date, 'YYYY-MM-DD') AS expiry_date,
-         ec.evidence_file_url,
-         c.certification_type, c.validity_months,
-         appr.full_name AS approved_by
-    FROM employee_certifications ec
-    LEFT JOIN certifications c ON c.id = ec.certification_id
-    LEFT JOIN employees appr   ON appr.id = ec.approved_by`;
-
-function selectCertification(client, certId) {
-  return client
-    .query(`${CERTIFICATION_SELECT} WHERE ec.id = $1`, [certId])
-    .then(({ rows }) => rows[0] || null);
-}
-
-// Certificate files live OUTSIDE the "<employeeId>/" prefix on purpose:
-// DELETE /:id/photo sweeps removePublicFolder(`${id}/`), which would otherwise
-// take a person's certificates with their profile picture.
-const certificatePrefix = (employeeId, certId) => `certificates/${employeeId}/${certId}/`;
-
-// A source='Catalog' row was issued through the approvals flow. Letting someone
-// edit or delete it from their own profile would let them rewrite — or erase —
-// an organisational record, so the self-service editor only owns 'Self' rows.
-const CATALOG_ROW_MESSAGE =
-  'This certification was issued through the organisation and cannot be changed here.';
-
-// Turn a typed skill name into a unique code, e.g. "Battery BMS" -> "BATTERY-BMS".
-async function uniqueSkillCode(client, name) {
-  const base =
-    name
-      .trim()
-      .toUpperCase()
-      .replace(/[^A-Z0-9]+/g, '-')
-      .replace(/^-|-$/g, '')
-      .slice(0, 20) || 'SKILL';
-  for (let i = 0; i < 20; i += 1) {
-    const candidate = i === 0 ? base : `${base}-${i + 1}`;
-    const { rows } = await client.query('SELECT 1 FROM skills WHERE code = $1', [candidate]);
-    if (rows.length === 0) return candidate;
-  }
-  return `${base}-${Math.floor(Math.random() * 100000)}`;
-}
-
-// ---------------------------------------------------------------
-// Directory & onboarding
-// ---------------------------------------------------------------
-
-// GET /api/employees/form-options — dropdown data for the Add Employee form.
-router.get('/form-options', requireRole(...MANAGE_ROLES), async (req, res, next) => {
-  try {
-    // The manager list is the caller's own subtree: you may place a new hire
-    // under yourself or under anyone already beneath you, and nowhere else.
-    // This used to return the entire active directory.
-    const managerParams = [];
-    const managerSql = `
-      SELECT e.id, e.full_name, e.org_title
-      FROM employees e
-      WHERE e.employment_status = 'Active'
-        AND e.id IN (${visibleIdsSql(req.user, managerParams)})
-      ORDER BY e.full_name`;
-
-    const [departments, teams, roles, locations, managers] = await Promise.all([
-      query('SELECT id, name FROM departments ORDER BY name'),
-      query('SELECT id, name, department_id FROM teams ORDER BY name'),
-      query('SELECT id, role_name FROM job_roles ORDER BY role_name'),
-      query('SELECT id, name FROM locations ORDER BY name'),
-      query(managerSql, managerParams),
-    ]);
-    res.json({
-      departments: departments.rows,
-      teams: teams.rows,
-      jobRoles: roles.rows,
-      locations: locations.rows,
-      managers: managers.rows,
-      orgTitles: ORG_TITLES,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /api/employees — create an employee (and, by default, a login account).
-router.post('/', requireRole(...MANAGE_ROLES), async (req, res, next) => {
-  const {
-    employee_code,
-    full_name,
-    email,
-    gender,
-    grade,
-    joining_date,
-    department_id,
-    team_id,
-    job_role_id,
-    manager_id,
-    location_id,
-    org_title,
-    create_login = true,
-  } = req.body || {};
-
-  if (!employee_code || !full_name || !email) {
-    return res.status(400).json({ error: 'employee_code, full_name and email are required' });
-  }
-  if (org_title && !ORG_TITLES.includes(org_title)) {
-    return res.status(400).json({ error: `org_title must be one of: ${ORG_TITLES.join(', ')}` });
-  }
-
-  // A manager is now required, and must be someone the caller can already see.
-  // Without this you could graft a new hire onto a branch you have no business
-  // touching — and a NULL manager would try to create a second root, which the
-  // uq_employees_single_root index rejects with an opaque error.
-  if (!manager_id) {
-    return res.status(400).json({ error: 'manager_id is required — every employee reports to someone' });
-  }
-  if (!(await canView(req.user, manager_id))) {
-    return res
-      .status(400)
-      .json({ error: 'You can only add people under yourself or someone who reports to you' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const emp = await client.query(
-      `INSERT INTO employees
-         (employee_code, full_name, email, gender, grade, joining_date,
-          department_id, team_id, job_role_id, manager_id, location_id, org_title,
-          sibling_order)
-       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
-          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
-       RETURNING id, employee_code, full_name, email, org_title`,
-      [
-        employee_code,
-        full_name,
-        email,
-        gender || null,
-        grade || null,
-        joining_date || null,
-        department_id || null,
-        team_id || null,
-        job_role_id || null,
-        manager_id,
-        location_id || null,
-        org_title || null,
-      ]
-    );
-    const employee = emp.rows[0];
-
-    if (create_login) {
-      const user = await client.query(
-        `INSERT INTO app_users (employee_id, email, display_name)
-         VALUES ($1,$2,$3) RETURNING id`,
-        [employee.id, email, full_name]
-      );
-      await client.query(
-        `INSERT INTO user_permission_role_map (user_id, permission_role_id)
-         SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
-         ON CONFLICT DO NOTHING`,
-        [user.rows[0].id]
-      );
-    }
-
-    await client.query('COMMIT');
-    res.status(201).json(employee);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    // Friendly message for duplicate code/email.
-    if (err.code === '23505') {
-      return res.status(409).json({ error: 'An employee with that code or email already exists' });
-    }
-    next(err);
-  } finally {
-    client.release();
-  }
-});
-
-// GET /api/employees?search= — lightweight directory (used by search & pickers).
-//
-// Scoped to the caller's subtree. A leaf employee sees exactly one row —
-// themselves — which falls out of the predicate rather than being special-cased.
-router.get('/', async (req, res, next) => {
-  try {
-    const { search } = req.query;
-    const params = [];
-    let where = "e.employment_status = 'Active'";
-    if (search) {
-      params.push(`%${search}%`);
-      where += ` AND (e.full_name ILIKE $${params.length} OR e.email ILIKE $${params.length})`;
-    }
-    where += ` AND e.id IN (${visibleIdsSql(req.user, params)})`;
-
-    const { rows } = await query(
-      `SELECT e.id, e.full_name, e.email, e.photo_url, e.org_title,
-              jr.role_name AS job_role, d.name AS department
-       FROM employees e
-       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-       LEFT JOIN departments d ON d.id = e.department_id
-       WHERE ${where}
-       ORDER BY e.full_name`,
-      params
-    );
-    res.json(rows);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/employees/me — the signed-in user's own identity, read live.
-//
-// The JWT carries a snapshot taken at login and lives for 12 hours, so anything
-// that changes in between — a new profile picture, a new hierarchy title, a
-// transfer — would otherwise not show until the user signed out and back in.
-// Always self-scoped, so it needs no visibility gate.
-//
-// Registered before the /:id/* routes so "me" is never read as an id.
-router.get('/me', async (req, res, next) => {
-  try {
-    const { rows } = await query(
-      `SELECT e.id, e.full_name, e.email, e.employee_code, e.photo_url, e.org_title,
-              e.grade, jr.role_name AS job_role, d.name AS department, t.name AS team,
-              mgr.full_name AS manager_name,
-              (SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id) AS direct_reports,
-              (SELECT count(*)::int FROM employee_subtree(e.id)) AS visible_people
-       FROM employees e
-       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-       LEFT JOIN departments d ON d.id = e.department_id
-       LEFT JOIN teams t ON t.id = e.team_id
-       LEFT JOIN employees mgr ON mgr.id = e.manager_id
-       WHERE e.id = $1`,
-      [req.user.employee_id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
-    res.json(rows[0]);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// GET /api/employees/org-chart — the caller's subtree as a flat, ordered list
-// the client can nest. depth is relative to the caller (0 = you).
-//
-// Registered before the /:id/* routes so "org-chart" is never read as an id.
-router.get('/org-chart', async (req, res, next) => {
-  try {
-    // Nesting is done client-side on manager_id: a node whose manager is absent
-    // from this set is a local root. That works identically for a mid-tree
-    // manager (one root: themselves) and for an admin (the whole org).
-    const params = [];
-    const scope = visibleIdsSql(req.user, params);
-
-    const { rows } = await query(
-      `SELECT t.id, t.manager_id, t.employee_code, t.full_name, t.org_title,
-              t.photo_url, t.display_label, t.structural_code, t.has_reports,
-              t.depth AS absolute_depth, t.employment_status,
-              jr.role_name AS job_role, d.name AS department
-       FROM v_employee_tree t
-       LEFT JOIN employees e ON e.id = t.id
-       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-       LEFT JOIN departments d ON d.id = e.department_id
-       WHERE t.id IN (${scope})
-       ORDER BY string_to_array(t.structural_code, '.')::int[]`,
-      params
-    );
-
-    // The chain above the caller: name + title only, never a full record.
-    const chain = await managerChain(req.user.employee_id);
-
-    res.json({ root: req.user.employee_id, nodes: rows, managerChain: chain });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ---------------------------------------------------------------
-// Profile (read)
-// ---------------------------------------------------------------
-
-// Gathers the whole profile payload for one employee. Shared by the JSON
-// profile endpoint and the PDF download, so the page and the downloaded CV can
-// never disagree about what a person's record says. Returns null when the id
-// names nobody.
-//
-// Callers own the visibility gate — this function does not apply one.
-async function loadProfile(id) {
-  const headerP = query(
-    `SELECT e.id, e.full_name, e.email, e.employee_code, e.grade, e.joining_date, e.photo_url,
-            e.org_title,
-            jr.role_name AS job_role, d.name AS department, t.name AS team,
-            l.name AS location,
-            mgr.full_name AS manager_name,
-            (SELECT me.full_name FROM mentor_assignments ma
-               JOIN employees me ON me.id = ma.mentor_id
-               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
-               ORDER BY ma.start_date ASC LIMIT 1) AS mentor_name,
-            (SELECT jr2.role_name FROM mentor_recommendations mr
-               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
-               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
-               ORDER BY mr.submitted_at DESC LIMIT 1) AS target_role
-     FROM employees e
-     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-     LEFT JOIN departments d ON d.id = e.department_id
-     LEFT JOIN teams t ON t.id = e.team_id
-     LEFT JOIN locations l ON l.id = e.location_id
-     LEFT JOIN employees mgr ON mgr.id = e.manager_id
-     WHERE e.id = $1`,
-    [id]
-  );
-
-  // Always returns a row for an existing employee, even with no CV yet.
-  const cvP = query(
-    `SELECT COALESCE(cv.verification_status, 'Draft') AS verification_status,
-            cv.headline, cv.summary, cv.phone, cv.location_text, cv.linkedin_url,
-            cv.verified_at, cv.updated_at,
-            vb.full_name AS verified_by_name,
-            (SELECT ap.full_name FROM approvals a
-               JOIN employees ap ON ap.id = a.approver_id
-               WHERE a.approval_type = 'Profile Verification'
-                 AND a.entity_id = e.id AND a.status = 'Pending'
-               ORDER BY a.requested_at DESC LIMIT 1) AS pending_with
-     FROM employees e
-     LEFT JOIN employee_cv cv ON cv.employee_id = e.id
-     LEFT JOIN employees vb ON vb.id = cv.verified_by
-     WHERE e.id = $1`,
-    [id]
-  );
-
-  const experienceP = query(
-    `SELECT ${EXPERIENCE_COLUMNS} FROM employee_experience
-     WHERE employee_id = $1
-     ORDER BY sort_order, start_date DESC NULLS LAST`,
-    [id]
-  );
-
-  const educationP = query(
-    `SELECT ${EDUCATION_COLUMNS} FROM employee_education
-     WHERE employee_id = $1
-     ORDER BY sort_order, end_year DESC NULLS LAST`,
-    [id]
-  );
-
-  const passportP = query(
-    `SELECT skill_id, skill_name, self_level, manager_level, mentor_level, effective_level
-     FROM v_employee_skill_matrix
-     WHERE employee_id = $1
-     ORDER BY effective_level DESC NULLS LAST, skill_name`,
-    [id]
-  );
-
-  const recentLearningP = query(
-    `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
-     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
-     WHERE te.employee_id = $1
-     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
-     LIMIT 8`,
-    [id]
-  );
-
-  // Widened for the Learning Module tab. The five keys the CV PDF reads
-  // (title / status / issued_date / expiry_date / approved_by) are all still
-  // here, with title falling back to title_text, so cvPdf.js needs no change.
-  const certsP = query(
-    `${CERTIFICATION_SELECT}
-     WHERE ec.employee_id = $1
-     ORDER BY ec.issued_date DESC NULLS LAST, COALESCE(c.title, ec.title_text)`,
-    [id]
-  );
-
-  // Whole-history counts for the Learning Module stat row. recentLearning above
-  // is LIMIT 8, so the tab cannot derive these from it. Certification figures
-  // are deliberately absent — the certifications array is complete, so the
-  // client counts valid/expiring itself rather than paying for another query.
-  const learningStatsP = query(
-    `SELECT
+// pg's count(*) is bigint and would arrive as a string, hence ::int; T-SQL's
+// COUNT(*) is already int, so the mssql branch just drops the cast. The hours
+// sum is cast on both sides for the same reason the averages in routes/skills.js
+// are: duration_hours is NUMERIC, which pg returns as a string and T-SQL as a
+// decimal, and the client wants a number.
+const Q_LEARNING_STATS = sql({
+  pg: `SELECT
        (SELECT count(*)::int FROM training_enrollments te
          WHERE te.employee_id = $1 AND te.status = 'Completed')             AS courses_completed,
        (SELECT count(*)::int FROM training_enrollments te
@@ -521,16 +511,36 @@ async function loadProfile(id) {
           FROM training_enrollments te
           JOIN training_courses tc ON tc.id = te.course_id
          WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`,
-    [id]
-  );
+  mssql: `SELECT
+       (SELECT count(*) FROM training_enrollments te
+         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS courses_completed,
+       (SELECT count(*) FROM training_enrollments te
+         WHERE te.employee_id = $1
+           AND te.status IN ('Nominated','Approved','In Progress'))         AS courses_in_progress,
+       (SELECT CAST(COALESCE(sum(tc.duration_hours), 0) AS float)
+          FROM training_enrollments te
+          JOIN training_courses tc ON tc.id = te.course_id
+         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`,
+});
 
-  // Courses still running, each with its module list and which modules are
-  // actually done. completed_at comes from enrollment_module_progress, so the
-  // ticks are a record rather than the estimate this used to derive from the
-  // course percentage. Ticking happens on the Learning Module page; the profile
-  // only reads it.
-  const enrollmentsP = query(
-    `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
+// Courses still running, each with its module list and which modules are done.
+//
+// Same JSON split as LABELS_JSON in routes/skills.js: pg builds the array with
+// json_agg, T-SQL with a correlated FOR JSON PATH. The two return different JS
+// types - an array from pg, a string from mssql - which parseModules() below
+// reconciles, so the response body is identical either way.
+//
+// INCLUDE_NULL_VALUES matters: FOR JSON PATH omits null keys by default, and the
+// client reads `completed_at == null` to mean "module not ticked". Without it an
+// unticked module would arrive with no completed_at key at all on mssql and a
+// null one on pg - the same value, but only one of them survives a `'completed_at'
+// in module` style check, and the shapes would no longer be identical.
+//
+// LIMIT 12 -> TOP 12. Safe to relocate here because it applies to the OUTER
+// statement, which has its own ORDER BY; the rewriter refuses to move a LIMIT
+// only because it cannot tell that case from a correlated subquery's.
+const Q_ACTIVE_ENROLLMENTS = sql({
+  pg: `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
             tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
             COALESCE((
               SELECT json_agg(json_build_object(
@@ -551,18 +561,67 @@ async function loadProfile(id) {
        AND te.status IN ('Nominated','Approved','In Progress')
      ORDER BY te.enrolled_at DESC
      LIMIT 12`,
-    [id]
-  );
+  mssql: `SELECT TOP 12
+            te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
+            tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
+            COALESCE((
+              SELECT cm.id                AS id,
+                     cm.module_order      AS module_order,
+                     cm.module_title      AS module_title,
+                     cm.duration_minutes  AS duration_minutes,
+                     emp.completed_at     AS completed_at
+              FROM course_modules cm
+              LEFT JOIN enrollment_module_progress emp
+                     ON emp.module_id = cm.id AND emp.enrollment_id = te.id
+              WHERE cm.course_id = tc.id
+              ORDER BY cm.module_order
+              FOR JSON PATH, INCLUDE_NULL_VALUES
+            ), '[]') AS modules
+     FROM training_enrollments te
+     JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+       AND te.status IN ('Nominated','Approved','In Progress')
+     ORDER BY te.enrolled_at DESC`,
+});
 
-  // The learning journey: one chronology out of four tables. Every branch
-  // produces the same five columns so the UNION types line up; the first branch
-  // fixes them (timestamptz, text, text, text, int).
-  //
-  // A "level up" is an assessment that beats every earlier one for that skill —
-  // a running max over the preceding rows — so a manager re-confirming L3 after
-  // L3 is not an event, and the very first rating is.
-  const timelineP = query(
-    `WITH level_ups AS (
+// Turns the `modules` column into an array whichever dialect produced it: pg's
+// json_agg is parsed by the driver already, FOR JSON PATH arrives as a string,
+// and both return nothing at all when the course has no modules.
+//
+// Same job as parseJsonColumn() in routes/skills.js, kept local for the same
+// reason that one is - one caller, and the fallback differs per column.
+function parseModules(rows) {
+  for (const row of rows) {
+    const v = row.modules;
+    if (Array.isArray(v)) continue;
+    if (typeof v === 'string' && v.length > 0) {
+      try {
+        const parsed = JSON.parse(v);
+        row.modules = Array.isArray(parsed) ? parsed : [];
+        continue;
+      } catch {
+        // fall through to the empty list
+      }
+    }
+    row.modules = [];
+  }
+  return rows;
+}
+
+// The learning journey: one chronology out of four tables. Every branch produces
+// the same six columns so the UNION types line up; the first branch fixes them.
+//
+// A "level up" is an assessment that beats every earlier one for that skill - a
+// running max over the preceding rows - so a manager re-confirming L3 after L3
+// is not an event, and the very first rating is. The window frame is identical
+// on both dialects; T-SQL has supported it since 2012.
+//
+// What diverges is only the scalar plumbing: `::` casts become CAST(), the `||`
+// concatenations become CONCAT() (T-SQL's `+` propagates NULL, CONCAT does not,
+// which is the behaviour the pg side relies on inside concat_ws), to_char
+// becomes FORMAT, and the outer LIMIT becomes TOP.
+const Q_LEARNING_TIMELINE = sql({
+  pg: `WITH level_ups AS (
        SELECT s.name AS skill_name, sa.assessed_level, sa.assessor_type, sa.assessed_at,
               MAX(sa.assessed_level) OVER (
                 PARTITION BY sa.skill_id ORDER BY sa.assessed_at
@@ -630,8 +689,633 @@ async function loadProfile(id) {
      ) events
      ORDER BY event_at DESC
      LIMIT 40`,
+  mssql: `WITH level_ups AS (
+       SELECT s.name AS skill_name, sa.assessed_level, sa.assessor_type, sa.assessed_at,
+              MAX(sa.assessed_level) OVER (
+                PARTITION BY sa.skill_id ORDER BY sa.assessed_at
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+              ) AS previous_best
+       FROM skill_assessments sa
+       JOIN skills s ON s.id = sa.skill_id
+       WHERE sa.employee_id = $1 AND sa.status IN ('Submitted','Approved')
+     )
+     SELECT TOP 40 * FROM (
+       SELECT CAST('course' AS NVARCHAR(450)) AS kind,
+              te.completed_at AS event_at,
+              tc.title AS title,
+              tc.course_type AS detail,
+              NULLIF(CONCAT_WS(' · ',
+                tc.delivery_mode,
+                CASE WHEN tc.duration_hours IS NOT NULL THEN CONCAT(tc.duration_hours, ' hrs') END,
+                CASE WHEN te.score IS NOT NULL THEN CONCAT('Score ', te.score) END), '') AS meta,
+              CAST(NULL AS int) AS level
+       FROM training_enrollments te
+       JOIN training_courses tc ON tc.id = te.course_id
+       WHERE te.employee_id = $1 AND te.status = 'Completed' AND te.completed_at IS NOT NULL
+
+       UNION ALL
+
+       SELECT CAST('certification' AS NVARCHAR(450)),
+              CAST(ec.issued_date AS DATETIMEOFFSET),
+              COALESCE(c.title, ec.title_text),
+              COALESCE(ec.issuer, c.certification_type, 'Certification'),
+              NULLIF(CONCAT_WS(' · ',
+                ec.institution,
+                CASE WHEN ec.expiry_date IS NOT NULL
+                     THEN CONCAT('Valid to ', FORMAT(ec.expiry_date, 'dd MMM yyyy')) END,
+                CASE WHEN ec.source = 'Self' THEN 'Self-reported' ELSE ec.status END), ''),
+              CAST(NULL AS int)
+       FROM employee_certifications ec
+       LEFT JOIN certifications c ON c.id = ec.certification_id
+       WHERE ec.employee_id = $1 AND ec.issued_date IS NOT NULL
+
+       UNION ALL
+
+       SELECT CAST('skill' AS NVARCHAR(450)),
+              lu.assessed_at,
+              lu.skill_name,
+              CASE WHEN lu.previous_best IS NULL
+                   THEN CONCAT('First rating · L', lu.assessed_level)
+                   ELSE CONCAT('L', lu.previous_best, ' → L', lu.assessed_level) END,
+              CONCAT(lu.assessor_type, ' assessment'),
+              lu.assessed_level
+       FROM level_ups lu
+       WHERE lu.previous_best IS NULL OR lu.assessed_level > lu.previous_best
+
+       UNION ALL
+
+       SELECT CAST('mentoring' AS NVARCHAR(450)),
+              ms.session_date,
+              ms.topic,
+              COALESCE(ms.mode, 'Session'),
+              mtr.full_name,
+              CAST(NULL AS int)
+       FROM mentoring_sessions ms
+       JOIN mentor_assignments ma ON ma.id = ms.mentor_assignment_id
+       JOIN employees mtr ON mtr.id = ma.mentor_id
+       WHERE ma.mentee_id = $1
+     ) events
+     ORDER BY event_at DESC`,
+});
+
+// One projection for certifications, used by the profile payload AND re-read
+// after every write: RETURNING cannot reach the joined catalogue title or the
+// approver's name, so writes select through this instead. That is what keeps the
+// object shape identical everywhere the client sees a certification.
+//
+// LEFT JOIN, not an inner one: a free-form row has no catalogue entry, and an
+// inner join would silently drop exactly the rows this list exists to show.
+//
+// Dates go out as 'YYYY-MM-DD' strings for the same reason EXPERIENCE_COLUMNS
+// does it — they land straight in an <input type="date">, and a Date round-trip
+// through JSON shifts the day across a timezone. Same per-dialect split as
+// EXPERIENCE_COLUMNS: to_char has no T-SQL token equivalent, CONVERT style 23
+// is the ISO yyyy-mm-dd form.
+const CERTIFICATION_SELECT = sql({
+  pg: `
+  SELECT ec.id, ec.certification_id, ec.source, ec.status,
+         COALESCE(c.title, ec.title_text) AS title,
+         ec.title_text, ec.issuer, ec.technology, ec.institution,
+         ec.credential_id, ec.credential_url, ec.hours, ec.notes,
+         to_char(ec.issued_date, 'YYYY-MM-DD') AS issued_date,
+         to_char(ec.expiry_date, 'YYYY-MM-DD') AS expiry_date,
+         ec.evidence_file_url,
+         c.certification_type, c.validity_months,
+         appr.full_name AS approved_by
+    FROM employee_certifications ec
+    LEFT JOIN certifications c ON c.id = ec.certification_id
+    LEFT JOIN employees appr   ON appr.id = ec.approved_by`,
+  mssql: `
+  SELECT ec.id, ec.certification_id, ec.source, ec.status,
+         COALESCE(c.title, ec.title_text) AS title,
+         ec.title_text, ec.issuer, ec.technology, ec.institution,
+         ec.credential_id, ec.credential_url, ec.hours, ec.notes,
+         CONVERT(varchar(10), ec.issued_date, 23) AS issued_date,
+         CONVERT(varchar(10), ec.expiry_date, 23) AS expiry_date,
+         ec.evidence_file_url,
+         c.certification_type, c.validity_months,
+         appr.full_name AS approved_by
+    FROM employee_certifications ec
+    LEFT JOIN certifications c ON c.id = ec.certification_id
+    LEFT JOIN employees appr   ON appr.id = ec.approved_by`,
+});
+
+// employee_certifications carries no updated_at trigger on either dialect, so
+// the mssql branch can OUTPUT straight to the caller rather than going through a
+// table variable the way Q_INSERT_EMPLOYEE has to.
+//
+// Only the id comes back: the row the client gets is re-read through
+// CERTIFICATION_SELECT, which OUTPUT could not produce anyway - it reaches the
+// joined catalogue title and the approver's name.
+const Q_INSERT_CERTIFICATION = sql({
+  pg: `INSERT INTO employee_certifications
+           (employee_id, source, status, certification_id, title_text, issuer, technology,
+            institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
+         VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING id`,
+  mssql: `INSERT INTO employee_certifications
+           (employee_id, source, status, certification_id, title_text, issuer, technology,
+            institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
+         OUTPUT INSERTED.id
+         VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+});
+
+function selectCertification(client, certId) {
+  return client
+    .query(`${CERTIFICATION_SELECT} WHERE ec.id = $1`, [certId])
+    .then(({ rows }) => rows[0] || null);
+}
+
+// Certificate files live OUTSIDE the "<employeeId>/" prefix on purpose:
+// DELETE /:id/photo sweeps removePublicFolder(`${id}/`), which would otherwise
+// take a person's certificates with their profile picture.
+const certificatePrefix = (employeeId, certId) => `certificates/${employeeId}/${certId}/`;
+
+// A source='Catalog' row was issued through the approvals flow. Letting someone
+// edit or delete it from their own profile would let them rewrite — or erase —
+// an organisational record, so the self-service editor only owns 'Self' rows.
+const CATALOG_ROW_MESSAGE =
+  'This certification was issued through the organisation and cannot be changed here.';
+
+// Turn a typed skill name into a unique code, e.g. "Battery BMS" -> "BATTERY-BMS".
+async function uniqueSkillCode(client, name) {
+  const base =
+    name
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 20) || 'SKILL';
+  for (let i = 0; i < 20; i += 1) {
+    const candidate = i === 0 ? base : `${base}-${i + 1}`;
+    const { rows } = await client.query('SELECT 1 FROM skills WHERE code = $1', [candidate]);
+    if (rows.length === 0) return candidate;
+  }
+  return `${base}-${Math.floor(Math.random() * 100000)}`;
+}
+
+// ---------------------------------------------------------------
+// Directory & onboarding
+// ---------------------------------------------------------------
+
+// The dropdown data behind both onboarding paths: the Add Employee form and the
+// Reference sheet of the bulk-import template. One loader, so a value that is
+// selectable in the form is always accepted by the importer and vice versa.
+async function loadFormOptions(user) {
+  // The manager list is the caller's own subtree: you may place a new hire
+  // under yourself or under anyone already beneath you, and nowhere else.
+  // This used to return the entire active directory.
+  //
+  // employee_code and email ride along because the spreadsheet needs an
+  // identifier a human can type; the form ignores them.
+  const managerParams = [];
+  const managerSql = `
+    SELECT e.id, e.full_name, e.org_title, e.employee_code, e.email
+    FROM employees e
+    WHERE e.employment_status = 'Active'
+      AND e.id IN (${visibleIdsSql(user, managerParams)})
+    ORDER BY e.full_name`;
+
+  const [departments, teams, roles, locations, managers] = await Promise.all([
+    query('SELECT id, name FROM departments ORDER BY name'),
+    query('SELECT id, name, department_id FROM teams ORDER BY name'),
+    query('SELECT id, role_name FROM job_roles ORDER BY role_name'),
+    query('SELECT id, name FROM locations ORDER BY name'),
+    query(managerSql, managerParams),
+  ]);
+
+  return {
+    departments: departments.rows,
+    teams: teams.rows,
+    jobRoles: roles.rows,
+    locations: locations.rows,
+    managers: managers.rows,
+    orgTitles: ORG_TITLES,
+  };
+}
+
+// The single INSERT path, shared by POST / and POST /bulk so the two can never
+// drift on what "creating an employee" means (sibling ordering, the default
+// login account, the employee permission role).
+async function insertEmployee(client, payload) {
+  const emp = await client.query(Q_INSERT_EMPLOYEE, [
+    payload.employee_code,
+    payload.full_name,
+    payload.email,
+    payload.gender || null,
+    payload.grade || null,
+    payload.joining_date || null,
+    payload.department_id || null,
+    payload.team_id || null,
+    payload.job_role_id || null,
+    payload.manager_id,
+    payload.location_id || null,
+    payload.org_title || null,
+  ]);
+  const created = emp.rows[0];
+
+  if (payload.create_login) {
+    const user = await client.query(Q_INSERT_APP_USER, [created.id, payload.email, payload.full_name]);
+    await client.query(Q_GRANT_DEFAULT_ROLE, [user.rows[0].id]);
+  }
+
+  return created;
+}
+
+// GET /api/employees/form-options — dropdown data for the Add Employee form.
+router.get('/form-options', requireRole(...MANAGE_ROLES), async (req, res, next) => {
+  try {
+    res.json(await loadFormOptions(req.user));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/employees — create an employee (and, by default, a login account).
+router.post('/', requireRole(...MANAGE_ROLES), async (req, res, next) => {
+  const {
+    employee_code,
+    full_name,
+    email,
+    gender,
+    grade,
+    joining_date,
+    department_id,
+    team_id,
+    job_role_id,
+    manager_id,
+    location_id,
+    org_title,
+    create_login = true,
+  } = req.body || {};
+
+  if (!employee_code || !full_name || !email) {
+    return res.status(400).json({ error: 'employee_code, full_name and email are required' });
+  }
+  if (org_title && !ORG_TITLES.includes(org_title)) {
+    return res.status(400).json({ error: `org_title must be one of: ${ORG_TITLES.join(', ')}` });
+  }
+
+  // A manager is now required, and must be someone the caller can already see.
+  // Without this you could graft a new hire onto a branch you have no business
+  // touching — and a NULL manager would try to create a second root, which the
+  // uq_employees_single_root index rejects with an opaque error.
+  if (!manager_id) {
+    return res.status(400).json({ error: 'manager_id is required — every employee reports to someone' });
+  }
+  if (!(await canView(req.user, manager_id))) {
+    return res
+      .status(400)
+      .json({ error: 'You can only add people under yourself or someone who reports to you' });
+  }
+
+  try {
+    const employee = await withTransaction((client) =>
+      insertEmployee(client, {
+        employee_code,
+        full_name,
+        email,
+        gender,
+        grade,
+        joining_date,
+        department_id,
+        team_id,
+        job_role_id,
+        manager_id,
+        location_id,
+        org_title,
+        create_login,
+      })
+    );
+
+    res.status(201).json(employee);
+  } catch (err) {
+    // Friendly message for duplicate code/email.
+    if (isUniqueViolation(err)) {
+      return res.status(409).json({ error: 'An employee with that code or email already exists' });
+    }
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Bulk onboarding from a spreadsheet
+// ---------------------------------------------------------------
+
+// GET /api/employees/import-template — the empty .xlsx an admin fills in.
+//
+// Generated per caller rather than served as a static file: the Reference sheet
+// carries THIS user's manager subtree, so the dropdown can only ever offer
+// people they are actually allowed to place a hire under.
+router.get('/import-template', requireRole(...MANAGE_ROLES), async (req, res, next) => {
+  try {
+    const options = await loadFormOptions(req.user);
+    const workbook = await buildTemplate(options);
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', 'attachment; filename="employee-import-template.xlsx"');
+    // Written to a buffer rather than piped: the workbook is a few KB, and a
+    // failure mid-stream would otherwise arrive after a 200 header with an
+    // attachment name already committed.
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/employees/bulk — create many employees from the filled-in template.
+//
+// ALL OR NOTHING. Every row is validated before anything is written, and the
+// inserts share one transaction, so an upload either lands completely or leaves
+// the directory untouched. A partial import is the worst outcome here: the admin
+// cannot tell which half went in without reading the response row by row, and
+// re-uploading the corrected file would duplicate the half that succeeded.
+router.post('/bulk', requireRole(...MANAGE_ROLES), uploadSheet, async (req, res, next) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  try {
+    const options = await loadFormOptions(req.user);
+    const rows = await readRows(req.file.buffer);
+    const { records, errors } = validateRows(rows, options);
+
+    // Codes and emails already taken. Checked up front so a collision is
+    // reported against its spreadsheet row, rather than surfacing as a unique
+    // violation that names neither the row nor which of the two columns clashed.
+    const codes = records.map((r) => r.payload.employee_code);
+    const emails = records.map((r) => r.payload.email);
+    if (codes.length) {
+      const params = [...codes, ...emails];
+      const codeList = codes.map((_, i) => `$${i + 1}`).join(',');
+      const emailList = emails.map((_, i) => `$${codes.length + i + 1}`).join(',');
+      const { rows: clashes } = await query(
+        `SELECT employee_code, email FROM employees
+          WHERE employee_code IN (${codeList}) OR LOWER(email) IN (${emailList})`,
+        params
+      );
+      const takenCodes = new Set(clashes.map((c) => normalizeKey(c.employee_code)));
+      const takenEmails = new Set(clashes.map((c) => normalizeKey(c.email)));
+      for (const record of records) {
+        const problems = [];
+        if (takenCodes.has(normalizeKey(record.payload.employee_code))) {
+          problems.push(`Employee Code "${record.payload.employee_code}" already exists`);
+        }
+        if (takenEmails.has(normalizeKey(record.payload.email))) {
+          problems.push(`Email "${record.payload.email}" already exists`);
+        }
+        if (problems.length) {
+          errors.push({ row: record.excelRow, name: record.payload.full_name, problems });
+        }
+      }
+    }
+
+    if (errors.length) {
+      errors.sort((a, b) => a.row - b.row);
+      return res.status(400).json({
+        error: `${errors.length} row${errors.length === 1 ? '' : 's'} could not be imported — nothing was saved.`,
+        rows: errors,
+      });
+    }
+
+    // `managerRef` rows report to someone created earlier in this same file, so
+    // their manager_id only exists once that row has been inserted. The
+    // validator has already guaranteed the reference points backwards, which is
+    // what makes a single forward pass sufficient.
+    const created = await withTransaction(async (client) => {
+      const done = [];
+      const idByRef = new Map();
+      for (const record of records) {
+        const payload = { ...record.payload };
+        if (!payload.manager_id) {
+          payload.manager_id = idByRef.get(normalizeKey(record.managerRef));
+        }
+        const row = await insertEmployee(client, payload);
+        for (const ref of [payload.employee_code, payload.email, payload.full_name]) {
+          const key = normalizeKey(ref);
+          if (key) idByRef.set(key, row.id);
+        }
+        done.push(row);
+      }
+      return done;
+    });
+
+    res.status(201).json({ created: created.length, employees: created });
+  } catch (err) {
+    if (err instanceof ImportError) {
+      return res.status(400).json({ error: err.message, rows: err.rows });
+    }
+    if (isUniqueViolation(err)) {
+      return res
+        .status(409)
+        .json({ error: 'An employee code or email in the file is already taken — nothing was saved.' });
+    }
+    next(err);
+  }
+});
+
+// GET /api/employees?search= — lightweight directory (used by search & pickers).
+//
+// Scoped to the caller's subtree. A leaf employee sees exactly one row —
+// themselves — which falls out of the predicate rather than being special-cased.
+router.get('/', async (req, res, next) => {
+  try {
+    const { search } = req.query;
+    const params = [];
+    let where = "e.employment_status = 'Active'";
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (e.full_name ILIKE $${params.length} OR e.email ILIKE $${params.length})`;
+    }
+    where += ` AND e.id IN (${visibleIdsSql(req.user, params)})`;
+
+    const { rows } = await query(
+      `SELECT e.id, e.full_name, e.email, e.photo_url, e.org_title,
+              jr.role_name AS job_role, d.name AS department
+       FROM employees e
+       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+       LEFT JOIN departments d ON d.id = e.department_id
+       WHERE ${where}
+       ORDER BY e.full_name`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/employees/me — the signed-in user's own identity, read live.
+//
+// The JWT carries a snapshot taken at login and lives for 12 hours, so anything
+// that changes in between — a new profile picture, a new hierarchy title, a
+// transfer — would otherwise not show until the user signed out and back in.
+// Always self-scoped, so it needs no visibility gate.
+//
+// Registered before the /:id/* routes so "me" is never read as an id.
+router.get('/me', async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT e.id, e.full_name, e.email, e.employee_code, e.photo_url, e.org_title,
+              e.grade, jr.role_name AS job_role, d.name AS department, t.name AS team,
+              mgr.full_name AS manager_name,
+              ${DIRECT_REPORTS_COUNT} AS direct_reports,
+              ${SUBTREE_COUNT} AS visible_people
+       FROM employees e
+       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+       LEFT JOIN departments d ON d.id = e.department_id
+       LEFT JOIN teams t ON t.id = e.team_id
+       LEFT JOIN employees mgr ON mgr.id = e.manager_id
+       WHERE e.id = $1`,
+      [req.user.employee_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/employees/org-chart — the caller's subtree as a flat, ordered list
+// the client can nest. depth is relative to the caller (0 = you).
+//
+// Registered before the /:id/* routes so "org-chart" is never read as an id.
+router.get('/org-chart', async (req, res, next) => {
+  try {
+    // Nesting is done client-side on manager_id: a node whose manager is absent
+    // from this set is a local root. That works identically for a mid-tree
+    // manager (one root: themselves) and for an admin (the whole org).
+    const params = [];
+    const scope = visibleIdsSql(req.user, params);
+
+    const { rows } = await query(
+      `SELECT t.id, t.manager_id, t.employee_code, t.full_name, t.org_title,
+              t.photo_url, t.display_label, t.structural_code, t.has_reports,
+              t.depth AS absolute_depth, t.employment_status,
+              jr.role_name AS job_role, d.name AS department
+       FROM v_employee_tree t
+       LEFT JOIN employees e ON e.id = t.id
+       LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+       LEFT JOIN departments d ON d.id = e.department_id
+       WHERE t.id IN (${scope})
+       ORDER BY t.sort_key`,
+      params
+    );
+
+    // The chain above the caller: name + title only, never a full record.
+    const chain = await managerChain(req.user.employee_id);
+
+    res.json({ root: req.user.employee_id, nodes: rows, managerChain: chain });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Profile (read)
+// ---------------------------------------------------------------
+
+// Gathers the whole profile payload for one employee. Shared by the JSON
+// profile endpoint and the PDF download, so the page and the downloaded CV can
+// never disagree about what a person's record says. Returns null when the id
+// names nobody.
+//
+// Callers own the visibility gate — this function does not apply one.
+async function loadProfile(id) {
+  const headerP = query(
+    `SELECT e.id, e.full_name, e.email, e.employee_code, e.grade, e.joining_date, e.photo_url,
+            e.org_title,
+            jr.role_name AS job_role, d.name AS department, t.name AS team,
+            l.name AS location,
+            mgr.full_name AS manager_name,
+            ${ACTIVE_MENTOR_NAME} AS mentor_name,
+            ${LATEST_TARGET_ROLE} AS target_role
+     FROM employees e
+     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
+     LEFT JOIN departments d ON d.id = e.department_id
+     LEFT JOIN teams t ON t.id = e.team_id
+     LEFT JOIN locations l ON l.id = e.location_id
+     LEFT JOIN employees mgr ON mgr.id = e.manager_id
+     WHERE e.id = $1`,
     [id]
   );
+
+  // Always returns a row for an existing employee, even with no CV yet.
+  const cvP = query(
+    `SELECT COALESCE(cv.verification_status, 'Draft') AS verification_status,
+            cv.headline, cv.summary, cv.phone, cv.location_text, cv.linkedin_url,
+            cv.verified_at, cv.updated_at,
+            vb.full_name AS verified_by_name,
+            ${PENDING_APPROVER} AS pending_with
+     FROM employees e
+     LEFT JOIN employee_cv cv ON cv.employee_id = e.id
+     LEFT JOIN employees vb ON vb.id = cv.verified_by
+     WHERE e.id = $1`,
+    [id]
+  );
+
+  const experienceP = query(
+    `SELECT ${EXPERIENCE_COLUMNS} FROM employee_experience
+     WHERE employee_id = $1
+     ORDER BY sort_order, start_date DESC NULLS LAST`,
+    [id]
+  );
+
+  const educationP = query(
+    `SELECT ${EDUCATION_COLUMNS} FROM employee_education
+     WHERE employee_id = $1
+     ORDER BY sort_order, end_year DESC NULLS LAST`,
+    [id]
+  );
+
+  const passportP = query(
+    `SELECT skill_id, skill_name, self_level, manager_level, mentor_level, effective_level
+     FROM v_employee_skill_matrix
+     WHERE employee_id = $1
+     ORDER BY effective_level DESC NULLS LAST, skill_name`,
+    [id]
+  );
+
+  const recentLearningP = query(
+    Q_RECENT_LEARNING,
+    [id]
+  );
+
+  // Widened for the Learning Module tab. The five keys the CV PDF reads
+  // (title / status / issued_date / expiry_date / approved_by) are all still
+  // here, with title falling back to title_text, so cvPdf.js needs no change.
+  const certsP = query(
+    `${CERTIFICATION_SELECT}
+     WHERE ec.employee_id = $1
+     ORDER BY ec.issued_date DESC NULLS LAST, COALESCE(c.title, ec.title_text)`,
+    [id]
+  );
+
+  // Whole-history counts for the Learning Module stat row. recentLearning above
+  // is LIMIT 8, so the tab cannot derive these from it. Certification figures
+  // are deliberately absent — the certifications array is complete, so the
+  // client counts valid/expiring itself rather than paying for another query.
+  const learningStatsP = query(Q_LEARNING_STATS, [id]);
+
+  // Courses still running, each with its module list and which modules are
+  // actually done. completed_at comes from enrollment_module_progress, so the
+  // ticks are a record rather than the estimate this used to derive from the
+  // course percentage. Ticking happens on the Learning Module page; the profile
+  // only reads it.
+  const enrollmentsP = query(Q_ACTIVE_ENROLLMENTS, [id]);
+
+  // The learning journey: one chronology out of four tables. Every branch
+  // produces the same five columns so the UNION types line up; the first branch
+  // fixes them (timestamptz, text, text, text, int).
+  //
+  // A "level up" is an assessment that beats every earlier one for that skill —
+  // a running max over the preceding rows — so a manager re-confirming L3 after
+  // L3 is not an event, and the very first rating is.
+  const timelineP = query(Q_LEARNING_TIMELINE, [id]);
 
   const mentorNotesP = query(
     `SELECT ms.session_date, ms.mode, ms.topic, ms.notes, ms.action_items,
@@ -646,16 +1330,7 @@ async function loadProfile(id) {
 
   // Direct reports — the DOWN side of the record, always full-record visible
   // because anyone you can see has a subtree contained in your own.
-  const reportsP = query(
-    `SELECT e.id, e.full_name, e.org_title, e.photo_url,
-            jr.role_name AS job_role,
-            EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id) AS has_reports
-     FROM employees e
-     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-     WHERE e.manager_id = $1
-     ORDER BY e.sibling_order, e.full_name`,
-    [id]
-  );
+  const reportsP = query(Q_DIRECT_REPORTS, [id]);
 
   // The UP side: name + title only, all the way to the Executive Officer.
   const chainP = managerChain(id);
@@ -706,7 +1381,7 @@ async function loadProfile(id) {
       courses_in_progress: 0,
       course_hours: 0,
     },
-    enrollments: enrollments.rows,
+    enrollments: parseModules(enrollments.rows),
     learningTimeline: timeline.rows,
     mentorNotes: mentorNotes.rows,
     directReports: reports.rows,
@@ -783,13 +1458,7 @@ router.patch('/:id/manager', requireRole(...MANAGE_ROLES), requireVisible(), asy
     }
 
     const { rows } = await query(
-      `UPDATE employees
-          SET manager_id    = $2,
-              org_title     = COALESCE($3, org_title),
-              sibling_order = COALESCE($4,
-                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
-        WHERE id = $1
-        RETURNING id, full_name, manager_id, org_title, sibling_order`,
+      Q_REPARENT,
       [
         id,
         manager_id,
@@ -804,8 +1473,9 @@ router.patch('/:id/manager', requireRole(...MANAGE_ROLES), requireVisible(), asy
     res.json(rows[0]);
   } catch (err) {
     // The cycle trigger raises check_violation; surface it as a conflict rather
-    // than a 500, since it is a legitimate thing for a caller to attempt.
-    if (err.code === '23514' && /Reporting cycle/i.test(err.message || '')) {
+    // than a 500, since it is a legitimate thing for a caller to attempt. The
+    // two dialects signal it differently, so the test goes through db/errors.js.
+    if (isReportingCycle(err)) {
       return res
         .status(409)
         .json({ error: 'That move would put someone under a person who already reports to them' });
@@ -826,16 +1496,7 @@ router.put('/:id/cv', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (employee_id) DO UPDATE
-           SET headline = EXCLUDED.headline,
-               summary = EXCLUDED.summary,
-               phone = EXCLUDED.phone,
-               location_text = EXCLUDED.location_text,
-               linkedin_url = EXCLUDED.linkedin_url
-         RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
-                   verification_status`,
+        Q_UPSERT_CV,
         [
           id,
           headline || null,
@@ -870,10 +1531,7 @@ router.post('/:id/experience', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_experience
-           (employee_id, title, organization, start_date, end_date, description, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))
-         RETURNING ${EXPERIENCE_COLUMNS}`,
+        Q_INSERT_EXPERIENCE,
         [
           id,
           title.trim(),
@@ -905,11 +1563,7 @@ router.put('/:id/experience/:expId', requireSelfOrAdmin(), async (req, res, next
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `UPDATE employee_experience
-            SET title = $3, organization = $4, start_date = $5, end_date = $6,
-                description = $7, sort_order = COALESCE($8, sort_order)
-          WHERE id = $1 AND employee_id = $2
-          RETURNING ${EXPERIENCE_COLUMNS}`,
+        Q_UPDATE_EXPERIENCE,
         [
           expId,
           id,
@@ -969,10 +1623,7 @@ router.post('/:id/education', requireSelfOrAdmin(), async (req, res, next) => {
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `INSERT INTO employee_education
-           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))
-         RETURNING ${EDUCATION_COLUMNS}`,
+        Q_INSERT_EDUCATION,
         [
           id,
           degree.trim(),
@@ -1006,11 +1657,7 @@ router.put('/:id/education/:eduId', requireSelfOrAdmin(), async (req, res, next)
 
     const row = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `UPDATE employee_education
-            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
-                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
-          WHERE id = $1 AND employee_id = $2
-          RETURNING ${EDUCATION_COLUMNS}`,
+        Q_UPDATE_EDUCATION,
         [
           eduId,
           id,
@@ -1112,14 +1759,10 @@ router.post('/:id/certifications', requireSelfOrAdmin(), async (req, res, next) 
       // added from a profile is self-reported, catalogue link or not. The link
       // only normalises the title and type; it does not confer approval, which
       // only the approvals flow can grant.
-      const { rows } = await client.query(
-        `INSERT INTO employee_certifications
-           (employee_id, source, status, certification_id, title_text, issuer, technology,
-            institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
-         VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         RETURNING id`,
-        [id, ...certificationValues(body)]
-      );
+      const { rows } = await client.query(Q_INSERT_CERTIFICATION, [
+        id,
+        ...certificationValues(body),
+      ]);
       return selectCertification(client, rows[0].id);
     });
 
@@ -1127,7 +1770,7 @@ router.post('/:id/certifications', requireSelfOrAdmin(), async (req, res, next) 
   } catch (err) {
     // UNIQUE(employee_id, certification_id, issued_date) — only reachable when a
     // catalogue certificate is added twice with the same issue date.
-    if (err.code === '23505') {
+    if (isUniqueViolation(err)) {
       return res.status(409).json({ error: 'That certificate is already on this profile.' });
     }
     next(err);
@@ -1166,7 +1809,7 @@ router.put('/:id/certifications/:certId', requireSelfOrAdmin(), async (req, res,
     if (outcome.state === 'catalog') return res.status(409).json({ error: CATALOG_ROW_MESSAGE });
     res.json(outcome.row);
   } catch (err) {
-    if (err.code === '23505') {
+    if (isUniqueViolation(err)) {
       return res.status(409).json({ error: 'That certificate is already on this profile.' });
     }
     next(err);
@@ -1310,9 +1953,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
 
       if (!resolvedId) {
         const name = skill_name.trim();
-        const existing = await client.query('SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1', [
-          name,
-        ]);
+        const existing = await client.query(Q_FIND_SKILL_BY_NAME, [name]);
         if (existing.rows.length) {
           resolvedId = existing.rows[0].id;
         } else {
@@ -1336,9 +1977,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
 
           const code = await uniqueSkillCode(client, name);
           const inserted = await client.query(
-            `INSERT INTO skills (code, name, description, category_id)
-             VALUES ($1, $2, 'Added from an employee profile', $3)
-             RETURNING id`,
+            Q_INSERT_SKILL_MINIMAL,
             [code, name, category_id]
           );
           resolvedId = inserted.rows[0].id;
@@ -1350,9 +1989,7 @@ router.post('/:id/skills', requireSelfOrAdmin(), async (req, res, next) => {
       }
 
       await client.query(
-        `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
-         VALUES ($1,$2,$3)
-         ON CONFLICT (employee_id, skill_id) DO NOTHING`,
+        Q_ASSIGN_SKILL,
         [id, resolvedId, req.user.employee_id]
       );
 
@@ -1387,10 +2024,7 @@ router.delete('/:id/skills/:skillId', requireSelfOrAdmin(), async (req, res, nex
 
     const outcome = await withTransaction(async (client) => {
       const others = await client.query(
-        `SELECT 1 FROM skill_assessments
-          WHERE employee_id = $1 AND skill_id = $2
-            AND assessor_type IN ('Manager','Mentor','SME')
-          LIMIT 1`,
+        Q_HAS_OTHER_ASSESSMENT,
         [id, skillId]
       );
       if (others.rows.length) return 'assessed';
@@ -1440,7 +2074,7 @@ router.post('/:id/photo', requireSelfOrAdmin(), uploadPhoto, async (req, res, ne
     const publicUrl = await uploadPublicFile(path, req.file.buffer, req.file.mimetype);
 
     const { rows } = await query(
-      'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
+      Q_SET_PHOTO,
       [id, publicUrl]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
@@ -1464,7 +2098,7 @@ router.delete('/:id/photo', requireSelfOrAdmin(), async (req, res, next) => {
     await removePublicFolder(`${id}/`);
 
     const { rows } = await query(
-      'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
+      Q_CLEAR_PHOTO,
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Employee not found' });

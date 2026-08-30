@@ -50,6 +50,10 @@ async function request(path, options = {}) {
   if (!res.ok) {
     const err = new Error((data && data.error) || `Request failed (${res.status})`);
     err.status = res.status;
+    // Some failures carry structured detail beyond the message — the bulk
+    // employee import answers a 400 with a per-row breakdown. Callers that know
+    // to look for it read `err.body`; everyone else keeps using `err.message`.
+    err.body = data;
     throw err;
   }
   return data;
