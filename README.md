@@ -165,6 +165,43 @@ any signed-in user could read anyone's full record; it no longer is.
 `department_head`. The manager dropdown is limited to the creator's own subtree,
 and a manager is required — there is exactly one root.
 
+**Bulk Add** on the same page onboards a whole team from a spreadsheet. Two
+buttons: *Sample Excel* downloads the template, *Bulk Add* uploads the filled-in
+copy. Both endpoints sit behind the same three roles, and the spreadsheet obeys
+the same rules as the form — it is the same `insertEmployee` underneath.
+
+- The template is **generated per caller**, not served from `/public`: its
+  Reference sheet carries that user's own manager subtree, so the Manager
+  dropdown can only ever offer people they are allowed to place a hire under. A
+  department head's copy lists their branch and nothing else.
+- Columns are matched by **header text**, so a reordered sheet or an extra column
+  of the customer's own still imports. Departments, teams, job roles, locations,
+  hierarchy titles and genders are typed as *names* and resolved to ids;
+  ambiguity (two teams called "Platform") is reported, never guessed.
+- Every lookup column **names its accepted values** — in the hint row under the
+  header, in a hover note on the header carrying the full list, and again in any
+  rejection. A generic "pick from the dropdown" is the one piece of guidance
+  guaranteed to waste the reader's time.
+- A `dropWhenEmpty` lookup column (Department, Team, Job Role, Location) is
+  **left out of the template entirely** when its table has no rows, which is the
+  state of a database built from `db/mssql/` — only `db/pg/02_seed.sql` ever
+  populated them. There is no value the writer could put in an empty dropdown
+  that would be accepted, so shipping the column can only produce a rejected
+  upload. It reappears on its own once the first row exists, and the parser
+  still knows the column, so a sheet downloaded earlier keeps importing.
+- A row's manager may be someone listed on an **earlier row of the same file**,
+  which is what lets a new team arrive with its lead in one upload. Forward
+  references are refused rather than reordered.
+- The import is **all-or-nothing**. Every row is validated, and every existing
+  code/email collision looked up, *before* anything is written; the inserts share
+  one transaction. A rejected upload answers `400` with a per-row breakdown of
+  everything wrong with the file at once and leaves the directory untouched.
+
+The format lives in `server/src/lib/employeeImport.js` — one module owning both
+the template and the parser, so the two cannot drift. It is deliberately
+database-free, which is what lets `server/test/employee-import.test.js` round-trip
+real workbooks through the real headers with no connection.
+
 ---
 
 ## 5. Organizational hierarchy and visibility

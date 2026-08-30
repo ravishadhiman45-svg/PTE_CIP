@@ -3,13 +3,43 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import useSWR, { mutate } from 'swr';
-import { Search, UserPlus, X } from 'lucide-react';
+import { Search, UserPlus, X, Download, Upload, FileSpreadsheet, CheckCircle2 } from 'lucide-react';
 import { fetcher, api } from '@/lib/api';
-import { PageHeader, Card, Skeleton, ErrorState, EmptyState, Avatar } from '@/components/ui';
+import { PageHeader, Card, Skeleton, ErrorState, EmptyState, Avatar, Toast } from '@/components/ui';
 import { useAuth } from '@/components/AuthProvider';
 
 // Roles that can onboard people (mirrors the server-side gate).
 const MANAGE_ROLES = ['admin', 'executive', 'department_head'];
+
+// The bulk-import template is generated per user — its Manager dropdown is the
+// caller's own subtree — so it comes from the API rather than /public. That also
+// means it needs the auth header, which is why this is api.download and not a
+// plain <a href>: a navigation cannot carry one.
+//
+// Offered from two places (the header button and the Bulk Add dialog), each of
+// which owns its own busy/error state, so the failure shows where the user
+// clicked rather than behind an open modal.
+const downloadTemplate = () =>
+  api.download('/employees/import-template', 'employee-import-template.xlsx');
+
+function useTemplateDownload() {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadErr, setDownloadErr] = useState('');
+
+  async function download() {
+    setDownloading(true);
+    setDownloadErr('');
+    try {
+      await downloadTemplate();
+    } catch (e) {
+      setDownloadErr(e.message);
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return { download, downloading, downloadErr };
+}
 
 export default function EmployeesPage() {
   const { user } = useAuth();
@@ -17,6 +47,9 @@ export default function EmployeesPage() {
 
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
+  const [toast, setToast] = useState('');
+  const { download, downloading, downloadErr } = useTemplateDownload();
 
   const key = `/employees${search ? `?search=${encodeURIComponent(search)}` : ''}`;
   const { data, error, isLoading } = useSWR(key, fetcher);
@@ -37,10 +70,18 @@ export default function EmployeesPage() {
   return (
     <div>
       <PageHeader title="Employees" subtitle="Directory and onboarding">
+        <button className="btn-ghost" onClick={download} disabled={downloading}>
+          <Download size={16} /> {downloading ? 'Preparing…' : 'Sample Excel'}
+        </button>
+        <button className="btn-ghost" onClick={() => setShowBulk(true)}>
+          <Upload size={16} /> Bulk Add
+        </button>
         <button className="btn-primary" onClick={() => setShowAdd(true)}>
           <UserPlus size={16} /> Add Employee
         </button>
       </PageHeader>
+
+      {downloadErr ? <p className="mb-3 text-xs text-bad">{downloadErr}</p> : null}
 
       <div className="relative mb-4 max-w-md">
         <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
@@ -100,6 +141,152 @@ export default function EmployeesPage() {
           }}
         />
       ) : null}
+
+      {showBulk ? (
+        <BulkAddModal
+          onClose={() => setShowBulk(false)}
+          onImported={(count) => {
+            setShowBulk(false);
+            setToast(`${count} employee${count === 1 ? '' : 's'} added`);
+            mutate(key);
+          }}
+        />
+      ) : null}
+
+      {toast ? <Toast message={toast} onDone={() => setToast('')} /> : null}
+    </div>
+  );
+}
+
+// Bulk onboarding: pick the filled-in template, upload, and — when the server
+// refuses it — show exactly which spreadsheet rows are wrong.
+//
+// The import is all-or-nothing on the server, so a failure here always means
+// nothing was written. That is worth saying plainly on screen: the admin's next
+// move is to fix the file and re-upload the whole thing, not to work out which
+// rows already made it in.
+function BulkAddModal({ onClose, onImported }) {
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [rowErrors, setRowErrors] = useState([]);
+  const { download, downloading, downloadErr } = useTemplateDownload();
+
+  function pick(e) {
+    const picked = e.target.files && e.target.files[0];
+    // Clearing the input is what makes the FIX-AND-RETRY loop work: a file input
+    // fires change only when its value actually changes, so re-picking the same
+    // path — which is exactly what happens after correcting the rows this dialog
+    // just listed — would otherwise do nothing and re-upload the stale pick.
+    e.target.value = '';
+    if (!picked) return;
+    setFile(picked);
+    setErr('');
+    setRowErrors([]);
+  }
+
+  async function upload() {
+    if (!file) return;
+    setBusy(true);
+    setErr('');
+    setRowErrors([]);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const result = await api.upload('/employees/bulk', form);
+      onImported(result.created);
+    } catch (e) {
+      setErr(e.message);
+      // The 400 body carries a per-row breakdown; api.js only lifts `error` onto
+      // the Error, so read the rest off the response it attached.
+      setRowErrors((e.body && e.body.rows) || []);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <Card>
+          <div className="mb-4 flex items-center justify-between">
+            <h3 className="text-base font-semibold text-white">Bulk Add Employees</h3>
+            <button onClick={onClose} className="text-slate-500 hover:text-white"><X size={18} /></button>
+          </div>
+
+          <ol className="mb-4 space-y-1.5 text-sm text-slate-400">
+            <li>
+              1. Download the{' '}
+              <button
+                className="text-accent-soft underline hover:text-white disabled:opacity-60"
+                onClick={download}
+                disabled={downloading}
+              >
+                {downloading ? 'preparing the template…' : 'sample Excel template'}
+              </button>
+              . Its dropdowns already list your departments, teams, job roles and managers.
+            </li>
+            <li>2. Fill in one row per person. Columns marked <span className="text-white">*</span> are required.</li>
+            <li>3. Upload it here. Either every row is added or none is — so a rejected file leaves the directory untouched.</li>
+          </ol>
+
+          <div className="rounded-lg border border-dashed border-line p-5 text-center">
+            <FileSpreadsheet size={28} className="mx-auto mb-2 text-slate-500" />
+            <label className="btn-ghost cursor-pointer">
+              {file ? 'Choose a different file' : 'Choose .xlsx file'}
+              <input
+                type="file"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                className="hidden"
+                onChange={pick}
+              />
+            </label>
+            <p className="mt-2 text-xs text-slate-500">
+              {file ? (
+                <span className="inline-flex items-center gap-1 text-slate-300">
+                  <CheckCircle2 size={13} className="text-good" /> {file.name}
+                </span>
+              ) : (
+                'Excel workbook (.xlsx) · up to 5 MB · max 500 rows'
+              )}
+            </p>
+          </div>
+
+          {err || downloadErr ? <p className="mt-3 text-xs text-bad">{err || downloadErr}</p> : null}
+
+          {rowErrors.length ? (
+            <div className="mt-3 max-h-64 overflow-y-auto rounded-lg border border-line">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-ink-700">
+                  <tr>
+                    <th className="th">Row</th>
+                    <th className="th">Employee</th>
+                    <th className="th">What to fix</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-line">
+                  {rowErrors.map((r) => (
+                    <tr key={r.row}>
+                      <td className="td font-mono text-slate-400">{r.row}</td>
+                      <td className="td text-slate-300">{r.name}</td>
+                      <td className="td text-bad">
+                        {r.problems.map((p, i) => <div key={i}>{p}</div>)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+
+          <div className="mt-4 flex justify-end gap-2">
+            <button className="btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="btn-primary" onClick={upload} disabled={busy || !file}>
+              {busy ? 'Importing…' : 'Upload & Add'}
+            </button>
+          </div>
+        </Card>
+      </div>
     </div>
   );
 }

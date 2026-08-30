@@ -8,6 +8,13 @@ const { visibleIdsSql, canView, managerChain } = require('../lib/visibility');
 const { streamCvPdf, cvFileName } = require('../lib/cvPdf');
 const { uploadPublicFile, removePublicFolder } = require('../storage');
 const { insertDefaultLevelDefinitions } = require('../lib/skillLevels');
+const {
+  buildTemplate,
+  readRows,
+  validateRows,
+  normalizeKey,
+  ImportError,
+} = require('../lib/employeeImport');
 
 const router = express.Router();
 
@@ -38,6 +45,36 @@ function uploadPhoto(req, res, next) {
     if (err) {
       const message =
         err.code === 'LIMIT_FILE_SIZE' ? 'Image must be smaller than 5 MB' : err.message;
+      return res.status(400).json({ error: message });
+    }
+    return next();
+  });
+}
+
+// The bulk-onboarding spreadsheet. Same memory-then-parse shape as the photo
+// upload; nothing is ever written to disk.
+//
+// Browsers disagree about the .xlsx mime type — Chrome sends the long
+// openxmlformats one, some Windows setups send application/octet-stream, and a
+// file dragged out of an email client can arrive as application/zip (which an
+// .xlsx genuinely is). So the extension is the gate, and the real check is
+// whether ExcelJS can parse it.
+const uploadWorkbook = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!/\.xlsx$/i.test(file.originalname || '')) {
+      return cb(new Error('Upload an .xlsx file — start from the sample template'));
+    }
+    return cb(null, true);
+  },
+});
+
+function uploadSheet(req, res, next) {
+  uploadWorkbook.single('file')(req, res, (err) => {
+    if (err) {
+      const message =
+        err.code === 'LIMIT_FILE_SIZE' ? 'The file must be smaller than 5 MB' : err.message;
       return res.status(400).json({ error: message });
     }
     return next();
@@ -451,35 +488,74 @@ async function uniqueSkillCode(client, name) {
 // Directory & onboarding
 // ---------------------------------------------------------------
 
+// The dropdown data behind both onboarding paths: the Add Employee form and the
+// Reference sheet of the bulk-import template. One loader, so a value that is
+// selectable in the form is always accepted by the importer and vice versa.
+async function loadFormOptions(user) {
+  // The manager list is the caller's own subtree: you may place a new hire
+  // under yourself or under anyone already beneath you, and nowhere else.
+  // This used to return the entire active directory.
+  //
+  // employee_code and email ride along because the spreadsheet needs an
+  // identifier a human can type; the form ignores them.
+  const managerParams = [];
+  const managerSql = `
+    SELECT e.id, e.full_name, e.org_title, e.employee_code, e.email
+    FROM employees e
+    WHERE e.employment_status = 'Active'
+      AND e.id IN (${visibleIdsSql(user, managerParams)})
+    ORDER BY e.full_name`;
+
+  const [departments, teams, roles, locations, managers] = await Promise.all([
+    query('SELECT id, name FROM departments ORDER BY name'),
+    query('SELECT id, name, department_id FROM teams ORDER BY name'),
+    query('SELECT id, role_name FROM job_roles ORDER BY role_name'),
+    query('SELECT id, name FROM locations ORDER BY name'),
+    query(managerSql, managerParams),
+  ]);
+
+  return {
+    departments: departments.rows,
+    teams: teams.rows,
+    jobRoles: roles.rows,
+    locations: locations.rows,
+    managers: managers.rows,
+    orgTitles: ORG_TITLES,
+  };
+}
+
+// The single INSERT path, shared by POST / and POST /bulk so the two can never
+// drift on what "creating an employee" means (sibling ordering, the default
+// login account, the employee permission role).
+async function insertEmployee(client, payload) {
+  const emp = await client.query(Q_INSERT_EMPLOYEE, [
+    payload.employee_code,
+    payload.full_name,
+    payload.email,
+    payload.gender || null,
+    payload.grade || null,
+    payload.joining_date || null,
+    payload.department_id || null,
+    payload.team_id || null,
+    payload.job_role_id || null,
+    payload.manager_id,
+    payload.location_id || null,
+    payload.org_title || null,
+  ]);
+  const created = emp.rows[0];
+
+  if (payload.create_login) {
+    const user = await client.query(Q_INSERT_APP_USER, [created.id, payload.email, payload.full_name]);
+    await client.query(Q_GRANT_DEFAULT_ROLE, [user.rows[0].id]);
+  }
+
+  return created;
+}
+
 // GET /api/employees/form-options — dropdown data for the Add Employee form.
 router.get('/form-options', requireRole(...MANAGE_ROLES), async (req, res, next) => {
   try {
-    // The manager list is the caller's own subtree: you may place a new hire
-    // under yourself or under anyone already beneath you, and nowhere else.
-    // This used to return the entire active directory.
-    const managerParams = [];
-    const managerSql = `
-      SELECT e.id, e.full_name, e.org_title
-      FROM employees e
-      WHERE e.employment_status = 'Active'
-        AND e.id IN (${visibleIdsSql(req.user, managerParams)})
-      ORDER BY e.full_name`;
-
-    const [departments, teams, roles, locations, managers] = await Promise.all([
-      query('SELECT id, name FROM departments ORDER BY name'),
-      query('SELECT id, name, department_id FROM teams ORDER BY name'),
-      query('SELECT id, role_name FROM job_roles ORDER BY role_name'),
-      query('SELECT id, name FROM locations ORDER BY name'),
-      query(managerSql, managerParams),
-    ]);
-    res.json({
-      departments: departments.rows,
-      teams: teams.rows,
-      jobRoles: roles.rows,
-      locations: locations.rows,
-      managers: managers.rows,
-      orgTitles: ORG_TITLES,
-    });
+    res.json(await loadFormOptions(req.user));
   } catch (err) {
     next(err);
   }
@@ -524,36 +600,149 @@ router.post('/', requireRole(...MANAGE_ROLES), async (req, res, next) => {
   }
 
   try {
-    const employee = await withTransaction(async (client) => {
-      const emp = await client.query(Q_INSERT_EMPLOYEE, [
+    const employee = await withTransaction((client) =>
+      insertEmployee(client, {
         employee_code,
         full_name,
         email,
-        gender || null,
-        grade || null,
-        joining_date || null,
-        department_id || null,
-        team_id || null,
-        job_role_id || null,
+        gender,
+        grade,
+        joining_date,
+        department_id,
+        team_id,
+        job_role_id,
         manager_id,
-        location_id || null,
-        org_title || null,
-      ]);
-      const created = emp.rows[0];
-
-      if (create_login) {
-        const user = await client.query(Q_INSERT_APP_USER, [created.id, email, full_name]);
-        await client.query(Q_GRANT_DEFAULT_ROLE, [user.rows[0].id]);
-      }
-
-      return created;
-    });
+        location_id,
+        org_title,
+        create_login,
+      })
+    );
 
     res.status(201).json(employee);
   } catch (err) {
     // Friendly message for duplicate code/email.
     if (isUniqueViolation(err)) {
       return res.status(409).json({ error: 'An employee with that code or email already exists' });
+    }
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------
+// Bulk onboarding from a spreadsheet
+// ---------------------------------------------------------------
+
+// GET /api/employees/import-template — the empty .xlsx an admin fills in.
+//
+// Generated per caller rather than served as a static file: the Reference sheet
+// carries THIS user's manager subtree, so the dropdown can only ever offer
+// people they are actually allowed to place a hire under.
+router.get('/import-template', requireRole(...MANAGE_ROLES), async (req, res, next) => {
+  try {
+    const options = await loadFormOptions(req.user);
+    const workbook = await buildTemplate(options);
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', 'attachment; filename="employee-import-template.xlsx"');
+    // Written to a buffer rather than piped: the workbook is a few KB, and a
+    // failure mid-stream would otherwise arrive after a 200 header with an
+    // attachment name already committed.
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/employees/bulk — create many employees from the filled-in template.
+//
+// ALL OR NOTHING. Every row is validated before anything is written, and the
+// inserts share one transaction, so an upload either lands completely or leaves
+// the directory untouched. A partial import is the worst outcome here: the admin
+// cannot tell which half went in without reading the response row by row, and
+// re-uploading the corrected file would duplicate the half that succeeded.
+router.post('/bulk', requireRole(...MANAGE_ROLES), uploadSheet, async (req, res, next) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  try {
+    const options = await loadFormOptions(req.user);
+    const rows = await readRows(req.file.buffer);
+    const { records, errors } = validateRows(rows, options);
+
+    // Codes and emails already taken. Checked up front so a collision is
+    // reported against its spreadsheet row, rather than surfacing as a unique
+    // violation that names neither the row nor which of the two columns clashed.
+    const codes = records.map((r) => r.payload.employee_code);
+    const emails = records.map((r) => r.payload.email);
+    if (codes.length) {
+      const params = [...codes, ...emails];
+      const codeList = codes.map((_, i) => `$${i + 1}`).join(',');
+      const emailList = emails.map((_, i) => `$${codes.length + i + 1}`).join(',');
+      const { rows: clashes } = await query(
+        `SELECT employee_code, email FROM employees
+          WHERE employee_code IN (${codeList}) OR LOWER(email) IN (${emailList})`,
+        params
+      );
+      const takenCodes = new Set(clashes.map((c) => normalizeKey(c.employee_code)));
+      const takenEmails = new Set(clashes.map((c) => normalizeKey(c.email)));
+      for (const record of records) {
+        const problems = [];
+        if (takenCodes.has(normalizeKey(record.payload.employee_code))) {
+          problems.push(`Employee Code "${record.payload.employee_code}" already exists`);
+        }
+        if (takenEmails.has(normalizeKey(record.payload.email))) {
+          problems.push(`Email "${record.payload.email}" already exists`);
+        }
+        if (problems.length) {
+          errors.push({ row: record.excelRow, name: record.payload.full_name, problems });
+        }
+      }
+    }
+
+    if (errors.length) {
+      errors.sort((a, b) => a.row - b.row);
+      return res.status(400).json({
+        error: `${errors.length} row${errors.length === 1 ? '' : 's'} could not be imported — nothing was saved.`,
+        rows: errors,
+      });
+    }
+
+    // `managerRef` rows report to someone created earlier in this same file, so
+    // their manager_id only exists once that row has been inserted. The
+    // validator has already guaranteed the reference points backwards, which is
+    // what makes a single forward pass sufficient.
+    const created = await withTransaction(async (client) => {
+      const done = [];
+      const idByRef = new Map();
+      for (const record of records) {
+        const payload = { ...record.payload };
+        if (!payload.manager_id) {
+          payload.manager_id = idByRef.get(normalizeKey(record.managerRef));
+        }
+        const row = await insertEmployee(client, payload);
+        for (const ref of [payload.employee_code, payload.email, payload.full_name]) {
+          const key = normalizeKey(ref);
+          if (key) idByRef.set(key, row.id);
+        }
+        done.push(row);
+      }
+      return done;
+    });
+
+    res.status(201).json({ created: created.length, employees: created });
+  } catch (err) {
+    if (err instanceof ImportError) {
+      return res.status(400).json({ error: err.message, rows: err.rows });
+    }
+    if (isUniqueViolation(err)) {
+      return res
+        .status(409)
+        .json({ error: 'An employee code or email in the file is already taken — nothing was saved.' });
     }
     next(err);
   }
