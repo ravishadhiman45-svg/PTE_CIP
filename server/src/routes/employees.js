@@ -6,7 +6,7 @@ const { query, pool } = require('../db');
 const { requireRole, requireSelfOrAdmin, requireVisible } = require('../middleware/auth');
 const { visibleIdsSql, canView, managerChain } = require('../lib/visibility');
 const { streamCvPdf, cvFileName } = require('../lib/cvPdf');
-const { uploadPublicFile, removePublicFolder } = require('../supabase');
+const { uploadPublicFile, removePublicFolder, removePublicFiles } = require('../supabase');
 const { insertDefaultLevelDefinitions } = require('../lib/skillLevels');
 
 const router = express.Router();
@@ -38,6 +38,32 @@ function uploadPhoto(req, res, next) {
     if (err) {
       const message =
         err.code === 'LIMIT_FILE_SIZE' ? 'Image must be smaller than 5 MB' : err.message;
+      return res.status(400).json({ error: message });
+    }
+    return next();
+  });
+}
+
+// Certificates are as often PDFs as images, and a scan is heavier than an
+// avatar. A separate instance rather than loosening the filter above: a profile
+// picture that is a PDF is still nonsense.
+const evidenceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!/^(application\/pdf|image\/(png|jpe?g|webp))$/.test(file.mimetype)) {
+      return cb(new Error('Only PDF, PNG, JPG or WEBP files are allowed'));
+    }
+    return cb(null, true);
+  },
+});
+
+// Same translation as uploadPhoto: multer's own errors are 400s, not 500s.
+function uploadEvidence(req, res, next) {
+  evidenceUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const message =
+        err.code === 'LIMIT_FILE_SIZE' ? 'Certificate must be smaller than 10 MB' : err.message;
       return res.status(400).json({ error: message });
     }
     return next();
@@ -96,6 +122,48 @@ const EXPERIENCE_COLUMNS = `id, title, organization,
 
 const EDUCATION_COLUMNS =
   'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
+
+// One projection for certifications, used by the profile payload AND re-read
+// after every write: RETURNING cannot reach the joined catalogue title or the
+// approver's name, so writes select through this instead. That is what keeps the
+// object shape identical everywhere the client sees a certification.
+//
+// LEFT JOIN, not an inner one: a free-form row has no catalogue entry, and an
+// inner join would silently drop exactly the rows this list exists to show.
+//
+// Dates go out as 'YYYY-MM-DD' strings for the same reason EXPERIENCE_COLUMNS
+// does it — they land straight in an <input type="date">, and a Date round-trip
+// through JSON shifts the day across a timezone.
+const CERTIFICATION_SELECT = `
+  SELECT ec.id, ec.certification_id, ec.source, ec.status,
+         COALESCE(c.title, ec.title_text) AS title,
+         ec.title_text, ec.issuer, ec.technology, ec.institution,
+         ec.credential_id, ec.credential_url, ec.hours, ec.notes,
+         to_char(ec.issued_date, 'YYYY-MM-DD') AS issued_date,
+         to_char(ec.expiry_date, 'YYYY-MM-DD') AS expiry_date,
+         ec.evidence_file_url,
+         c.certification_type, c.validity_months,
+         appr.full_name AS approved_by
+    FROM employee_certifications ec
+    LEFT JOIN certifications c ON c.id = ec.certification_id
+    LEFT JOIN employees appr   ON appr.id = ec.approved_by`;
+
+function selectCertification(client, certId) {
+  return client
+    .query(`${CERTIFICATION_SELECT} WHERE ec.id = $1`, [certId])
+    .then(({ rows }) => rows[0] || null);
+}
+
+// Certificate files live OUTSIDE the "<employeeId>/" prefix on purpose:
+// DELETE /:id/photo sweeps removePublicFolder(`${id}/`), which would otherwise
+// take a person's certificates with their profile picture.
+const certificatePrefix = (employeeId, certId) => `certificates/${employeeId}/${certId}/`;
+
+// A source='Catalog' row was issued through the approvals flow. Letting someone
+// edit or delete it from their own profile would let them rewrite — or erase —
+// an organisational record, so the self-service editor only owns 'Self' rows.
+const CATALOG_ROW_MESSAGE =
+  'This certification was issued through the organisation and cannot be changed here.';
 
 // Turn a typed skill name into a unique code, e.g. "Battery BMS" -> "BATTERY-BMS".
 async function uniqueSkillCode(client, name) {
@@ -428,13 +496,135 @@ async function loadProfile(id) {
     [id]
   );
 
+  // Widened for the Learning Module tab. The five keys the CV PDF reads
+  // (title / status / issued_date / expiry_date / approved_by) are all still
+  // here, with title falling back to title_text, so cvPdf.js needs no change.
   const certsP = query(
-    `SELECT c.title, ec.status, ec.issued_date, ec.expiry_date, appr.full_name AS approved_by
-     FROM employee_certifications ec
-     JOIN certifications c ON c.id = ec.certification_id
-     LEFT JOIN employees appr ON appr.id = ec.approved_by
+    `${CERTIFICATION_SELECT}
      WHERE ec.employee_id = $1
-     ORDER BY ec.issued_date DESC NULLS LAST`,
+     ORDER BY ec.issued_date DESC NULLS LAST, COALESCE(c.title, ec.title_text)`,
+    [id]
+  );
+
+  // Whole-history counts for the Learning Module stat row. recentLearning above
+  // is LIMIT 8, so the tab cannot derive these from it. Certification figures
+  // are deliberately absent — the certifications array is complete, so the
+  // client counts valid/expiring itself rather than paying for another query.
+  const learningStatsP = query(
+    `SELECT
+       (SELECT count(*)::int FROM training_enrollments te
+         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS courses_completed,
+       (SELECT count(*)::int FROM training_enrollments te
+         WHERE te.employee_id = $1
+           AND te.status IN ('Nominated','Approved','In Progress'))         AS courses_in_progress,
+       (SELECT COALESCE(sum(tc.duration_hours), 0)::float
+          FROM training_enrollments te
+          JOIN training_courses tc ON tc.id = te.course_id
+         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`,
+    [id]
+  );
+
+  // Courses still running, each with its module list. The modules ride along
+  // instead of lazy-loading from GET /api/training/:id when a row is expanded:
+  // this profile is one payload by design, and three small columns per module
+  // for at most a dozen courses is smaller than the experience section already
+  // in here.
+  const enrollmentsP = query(
+    `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
+            tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
+            COALESCE((
+              SELECT json_agg(json_build_object(
+                       'module_order',     cm.module_order,
+                       'module_title',     cm.module_title,
+                       'duration_minutes', cm.duration_minutes)
+                     ORDER BY cm.module_order)
+              FROM course_modules cm WHERE cm.course_id = tc.id
+            ), '[]'::json) AS modules
+     FROM training_enrollments te
+     JOIN training_courses tc ON tc.id = te.course_id
+     WHERE te.employee_id = $1
+       AND te.status IN ('Nominated','Approved','In Progress')
+     ORDER BY te.enrolled_at DESC
+     LIMIT 12`,
+    [id]
+  );
+
+  // The learning journey: one chronology out of four tables. Every branch
+  // produces the same five columns so the UNION types line up; the first branch
+  // fixes them (timestamptz, text, text, text, int).
+  //
+  // A "level up" is an assessment that beats every earlier one for that skill —
+  // a running max over the preceding rows — so a manager re-confirming L3 after
+  // L3 is not an event, and the very first rating is.
+  const timelineP = query(
+    `WITH level_ups AS (
+       SELECT s.name AS skill_name, sa.assessed_level, sa.assessor_type, sa.assessed_at,
+              MAX(sa.assessed_level) OVER (
+                PARTITION BY sa.skill_id ORDER BY sa.assessed_at
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+              ) AS previous_best
+       FROM skill_assessments sa
+       JOIN skills s ON s.id = sa.skill_id
+       WHERE sa.employee_id = $1 AND sa.status IN ('Submitted','Approved')
+     )
+     SELECT * FROM (
+       SELECT 'course'::text AS kind,
+              te.completed_at AS event_at,
+              tc.title AS title,
+              tc.course_type AS detail,
+              NULLIF(concat_ws(' · ',
+                tc.delivery_mode,
+                CASE WHEN tc.duration_hours IS NOT NULL THEN tc.duration_hours || ' hrs' END,
+                CASE WHEN te.score IS NOT NULL THEN 'Score ' || te.score END), '') AS meta,
+              NULL::int AS level
+       FROM training_enrollments te
+       JOIN training_courses tc ON tc.id = te.course_id
+       WHERE te.employee_id = $1 AND te.status = 'Completed' AND te.completed_at IS NOT NULL
+
+       UNION ALL
+
+       SELECT 'certification',
+              ec.issued_date::timestamptz,
+              COALESCE(c.title, ec.title_text),
+              COALESCE(ec.issuer, c.certification_type, 'Certification'),
+              NULLIF(concat_ws(' · ',
+                ec.institution,
+                CASE WHEN ec.expiry_date IS NOT NULL
+                     THEN 'Valid to ' || to_char(ec.expiry_date, 'DD Mon YYYY') END,
+                CASE WHEN ec.source = 'Self' THEN 'Self-reported' ELSE ec.status END), ''),
+              NULL::int
+       FROM employee_certifications ec
+       LEFT JOIN certifications c ON c.id = ec.certification_id
+       WHERE ec.employee_id = $1 AND ec.issued_date IS NOT NULL
+
+       UNION ALL
+
+       SELECT 'skill',
+              lu.assessed_at,
+              lu.skill_name,
+              CASE WHEN lu.previous_best IS NULL
+                   THEN 'First rating · L' || lu.assessed_level
+                   ELSE 'L' || lu.previous_best || ' → L' || lu.assessed_level END,
+              lu.assessor_type || ' assessment',
+              lu.assessed_level
+       FROM level_ups lu
+       WHERE lu.previous_best IS NULL OR lu.assessed_level > lu.previous_best
+
+       UNION ALL
+
+       SELECT 'mentoring',
+              ms.session_date,
+              ms.topic,
+              COALESCE(ms.mode, 'Session'),
+              mtr.full_name,
+              NULL::int
+       FROM mentoring_sessions ms
+       JOIN mentor_assignments ma ON ma.id = ms.mentor_assignment_id
+       JOIN employees mtr ON mtr.id = ma.mentor_id
+       WHERE ma.mentee_id = $1
+     ) events
+     ORDER BY event_at DESC
+     LIMIT 40`,
     [id]
   );
 
@@ -465,19 +655,36 @@ async function loadProfile(id) {
   // The UP side: name + title only, all the way to the Executive Officer.
   const chainP = managerChain(id);
 
-  const [header, cv, experience, education, passport, recentLearning, certs, mentorNotes, reports, chain] =
-    await Promise.all([
-      headerP,
-      cvP,
-      experienceP,
-      educationP,
-      passportP,
-      recentLearningP,
-      certsP,
-      mentorNotesP,
-      reportsP,
-      chainP,
-    ]);
+  // Positional — a new promise needs a name in the same slot on both sides.
+  const [
+    header,
+    cv,
+    experience,
+    education,
+    passport,
+    recentLearning,
+    certs,
+    learningStats,
+    enrollments,
+    timeline,
+    mentorNotes,
+    reports,
+    chain,
+  ] = await Promise.all([
+    headerP,
+    cvP,
+    experienceP,
+    educationP,
+    passportP,
+    recentLearningP,
+    certsP,
+    learningStatsP,
+    enrollmentsP,
+    timelineP,
+    mentorNotesP,
+    reportsP,
+    chainP,
+  ]);
 
   if (header.rows.length === 0) return null;
 
@@ -489,6 +696,13 @@ async function loadProfile(id) {
     skillsPassport: passport.rows,
     recentLearning: recentLearning.rows,
     certifications: certs.rows,
+    learningStats: learningStats.rows[0] || {
+      courses_completed: 0,
+      courses_in_progress: 0,
+      course_hours: 0,
+    },
+    enrollments: enrollments.rows,
+    learningTimeline: timeline.rows,
     mentorNotes: mentorNotes.rows,
     directReports: reports.rows,
     managerChain: chain,
@@ -835,6 +1049,235 @@ router.delete('/:id/education/:eduId', requireSelfOrAdmin(), async (req, res, ne
     next(err);
   }
 });
+
+// ---------------------------------------------------------------
+// Certifications (self-service)
+//
+// These routes only ever own source='Self' rows — see CATALOG_ROW_MESSAGE.
+//
+// Unlike experience / education / skills, these deliberately do NOT call
+// resetVerification. Those sections print into the CV PDF with no marker, so an
+// edit after verification is invisible to a reader and has to invalidate it. A
+// certificate prints its status first (cvPdf.js drawCertifications), so a
+// self-added one already reads "Self-Reported · Issued …" with no approver —
+// the PDF discloses it on its own, and knocking a whole verified profile back to
+// Draft over an entry that is already labelled unverified only punishes people
+// for keeping their record current.
+// ---------------------------------------------------------------
+
+// Blank strings from a form field mean "not filled in", not an empty value.
+const blankToNull = (value) => {
+  const text = typeof value === 'string' ? value.trim() : value;
+  return text === '' || text === undefined ? null : text;
+};
+
+const numberOrNull = (value) =>
+  value === '' || value === null || value === undefined || !Number.isFinite(Number(value))
+    ? null
+    : Number(value);
+
+// The values every cert write puts in the same order, matching $3..$12 below.
+function certificationValues(body) {
+  return [
+    blankToNull(body.certification_id),
+    blankToNull(body.title_text),
+    blankToNull(body.issuer),
+    blankToNull(body.technology),
+    blankToNull(body.institution),
+    blankToNull(body.issued_date),
+    blankToNull(body.expiry_date),
+    blankToNull(body.credential_id),
+    blankToNull(body.credential_url),
+    numberOrNull(body.hours),
+    blankToNull(body.notes),
+  ];
+}
+
+// POST /api/employees/:id/certifications
+router.post('/:id/certifications', requireSelfOrAdmin(), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const body = req.body || {};
+    if (!blankToNull(body.certification_id) && !blankToNull(body.title_text)) {
+      return res.status(400).json({ error: 'Pick a certificate from the catalogue, or type a title' });
+    }
+
+    const row = await withTransaction(async (client) => {
+      // source and status are derived here, never taken from the body: anything
+      // added from a profile is self-reported, catalogue link or not. The link
+      // only normalises the title and type; it does not confer approval, which
+      // only the approvals flow can grant.
+      const { rows } = await client.query(
+        `INSERT INTO employee_certifications
+           (employee_id, source, status, certification_id, title_text, issuer, technology,
+            institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
+         VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING id`,
+        [id, ...certificationValues(body)]
+      );
+      return selectCertification(client, rows[0].id);
+    });
+
+    res.status(201).json(row);
+  } catch (err) {
+    // UNIQUE(employee_id, certification_id, issued_date) — only reachable when a
+    // catalogue certificate is added twice with the same issue date.
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That certificate is already on this profile.' });
+    }
+    next(err);
+  }
+});
+
+// PUT /api/employees/:id/certifications/:certId
+router.put('/:id/certifications/:certId', requireSelfOrAdmin(), async (req, res, next) => {
+  try {
+    const { id, certId } = req.params;
+    const body = req.body || {};
+    if (!blankToNull(body.certification_id) && !blankToNull(body.title_text)) {
+      return res.status(400).json({ error: 'Pick a certificate from the catalogue, or type a title' });
+    }
+
+    const outcome = await withTransaction(async (client) => {
+      const owned = await client.query(
+        'SELECT source FROM employee_certifications WHERE id = $1 AND employee_id = $2',
+        [certId, id]
+      );
+      if (owned.rows.length === 0) return { state: 'missing' };
+      if (owned.rows[0].source !== 'Self') return { state: 'catalog' };
+
+      await client.query(
+        `UPDATE employee_certifications
+            SET certification_id = $3, title_text = $4, issuer = $5, technology = $6,
+                institution = $7, issued_date = $8, expiry_date = $9, credential_id = $10,
+                credential_url = $11, hours = $12, notes = $13
+          WHERE id = $1 AND employee_id = $2`,
+        [certId, id, ...certificationValues(body)]
+      );
+      return { state: 'ok', row: await selectCertification(client, certId) };
+    });
+
+    if (outcome.state === 'missing') return res.status(404).json({ error: 'Certification not found' });
+    if (outcome.state === 'catalog') return res.status(409).json({ error: CATALOG_ROW_MESSAGE });
+    res.json(outcome.row);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That certificate is already on this profile.' });
+    }
+    next(err);
+  }
+});
+
+// DELETE /api/employees/:id/certifications/:certId
+router.delete('/:id/certifications/:certId', requireSelfOrAdmin(), async (req, res, next) => {
+  try {
+    const { id, certId } = req.params;
+
+    const owned = await query(
+      'SELECT source FROM employee_certifications WHERE id = $1 AND employee_id = $2',
+      [certId, id]
+    );
+    if (owned.rows.length === 0) return res.status(404).json({ error: 'Certification not found' });
+    if (owned.rows[0].source !== 'Self') return res.status(409).json({ error: CATALOG_ROW_MESSAGE });
+
+    // Objects go first, for the same reason DELETE /:id/photo purges before it
+    // clears the column: a leftover file in a public bucket stays reachable by
+    // url with nothing pointing at it, whereas a row pointing at an object that
+    // is already gone just shows a dead link the user can retry deleting. The
+    // folder holds this certificate's files only.
+    await removePublicFolder(certificatePrefix(id, certId));
+
+    await query('DELETE FROM employee_certifications WHERE id = $1 AND employee_id = $2', [
+      certId,
+      id,
+    ]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/employees/:id/certifications/:certId/evidence  (multipart, field "file")
+// No resetVerification here: attaching evidence changes no character of the CV
+// PDF and only strengthens the claim already on it.
+router.post(
+  '/:id/certifications/:certId/evidence',
+  requireSelfOrAdmin(),
+  uploadEvidence,
+  async (req, res, next) => {
+    try {
+      const { id, certId } = req.params;
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name: file)' });
+
+      const existing = await query(
+        'SELECT evidence_path, source FROM employee_certifications WHERE id = $1 AND employee_id = $2',
+        [certId, id]
+      );
+      if (existing.rows.length === 0) return res.status(404).json({ error: 'Certification not found' });
+      if (existing.rows[0].source !== 'Self') {
+        return res.status(409).json({ error: CATALOG_ROW_MESSAGE });
+      }
+
+      const ext = (req.file.originalname.split('.').pop() || 'pdf').toLowerCase().slice(0, 5);
+      const path = `${certificatePrefix(id, certId)}evidence-${Date.now()}.${ext}`;
+      const publicUrl = await uploadPublicFile(path, req.file.buffer, req.file.mimetype);
+
+      await query(
+        `UPDATE employee_certifications SET evidence_file_url = $3, evidence_path = $4
+          WHERE id = $1 AND employee_id = $2`,
+        [certId, id, publicUrl, path]
+      );
+
+      // Replace, don't accumulate — but only once the row points at the new file.
+      // The other order would turn a failed upload into a certificate with no
+      // evidence at all; this way the worst case is one orphaned object.
+      const previous = existing.rows[0].evidence_path;
+      if (previous && previous !== path) {
+        try {
+          await removePublicFiles([previous]);
+        } catch (e) {
+          console.warn('[storage] could not remove replaced certificate file:', e.message);
+        }
+      }
+
+      const { rows } = await query(`${CERTIFICATION_SELECT} WHERE ec.id = $1`, [certId]);
+      res.json(rows[0]);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// DELETE /api/employees/:id/certifications/:certId/evidence
+router.delete(
+  '/:id/certifications/:certId/evidence',
+  requireSelfOrAdmin(),
+  async (req, res, next) => {
+    try {
+      const { id, certId } = req.params;
+
+      const owned = await query(
+        'SELECT source FROM employee_certifications WHERE id = $1 AND employee_id = $2',
+        [certId, id]
+      );
+      if (owned.rows.length === 0) return res.status(404).json({ error: 'Certification not found' });
+      if (owned.rows[0].source !== 'Self') return res.status(409).json({ error: CATALOG_ROW_MESSAGE });
+
+      await removePublicFolder(certificatePrefix(id, certId));
+      await query(
+        `UPDATE employee_certifications SET evidence_file_url = NULL, evidence_path = NULL
+          WHERE id = $1 AND employee_id = $2`,
+        [certId, id]
+      );
+
+      const { rows } = await query(`${CERTIFICATION_SELECT} WHERE ec.id = $1`, [certId]);
+      res.json(rows[0]);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // ---------------------------------------------------------------
 // Skills typed in by the employee

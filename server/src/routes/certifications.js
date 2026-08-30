@@ -5,6 +5,24 @@ const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
 
+// GET /api/certifications/catalog
+// The company's certification list, for the picker on a profile's Learning
+// Module tab. Catalogue data, not people data, so it carries no subtree
+// predicate — same reasoning as the skills library.
+router.get('/catalog', async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, title, certification_type, validity_months
+       FROM certifications
+       WHERE active = TRUE
+       ORDER BY title`
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/certifications?status=&search=
 router.get('/', async (req, res, next) => {
   try {
@@ -18,7 +36,9 @@ router.get('/', async (req, res, next) => {
     }
     if (search) {
       params.push(`%${search}%`);
-      where.push(`(e.full_name ILIKE $${params.length} OR c.title ILIKE $${params.length})`);
+      where.push(
+        `(e.full_name ILIKE $${params.length} OR COALESCE(c.title, ec.title_text) ILIKE $${params.length})`
+      );
     }
     // This tracker names the person holding each certification, so it is a
     // per-employee list and follows the subtree rule.
@@ -26,12 +46,17 @@ router.get('/', async (req, res, next) => {
     const whereSql = `WHERE ${where.join(' AND ')}`;
 
     const { rows } = await query(
-      `SELECT ec.id, e.full_name AS employee, e.org_title, c.title AS certification,
-              c.certification_type, ec.status, ec.issued_date, ec.expiry_date,
+      // LEFT JOIN on the catalogue: a certificate an employee typed in on their
+      // own profile has no catalogue row, and an inner join would hide it from a
+      // page called "Certification Tracker" with no sign anything was missing.
+      `SELECT ec.id, e.full_name AS employee, e.org_title,
+              COALESCE(c.title, ec.title_text) AS certification,
+              COALESCE(c.certification_type, 'Self-Reported') AS certification_type,
+              ec.source, ec.status, ec.issued_date, ec.expiry_date,
               appr.full_name AS approved_by
        FROM employee_certifications ec
        JOIN employees e ON e.id = ec.employee_id
-       JOIN certifications c ON c.id = ec.certification_id
+       LEFT JOIN certifications c ON c.id = ec.certification_id
        LEFT JOIN employees appr ON appr.id = ec.approved_by
        ${whereSql}
        ORDER BY ec.issued_date DESC NULLS LAST, e.full_name`,

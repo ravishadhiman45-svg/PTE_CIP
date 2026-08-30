@@ -9,6 +9,10 @@
 --   * employee_education   — education rows
 --   * 'Profile Verification' as an allowed approvals.approval_type
 --
+-- The three tables are also in 01_schema.sql now, defined identically, so a
+-- fresh build already has them and every CREATE below is a no-op. This file is
+-- only needed by databases built before they were folded into 01.
+--
 -- Skills typed in by an employee reuse the existing tables
 -- (employee_skill_assignments + skill_assessments with assessor_type 'Self'),
 -- so v_employee_skill_matrix / the Skills Passport pick them up for free.

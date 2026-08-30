@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS organizations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- CREATE TRIGGER has no IF NOT EXISTS, so each one is dropped first. Without
+-- this the whole file is single-use: everything else here is guarded, and
+-- re-running it would fail on the first trigger with "already exists". Same
+-- pattern as 05_profile_cv.sql and 07_org_hierarchy.sql.
+DROP TRIGGER IF EXISTS trg_organizations_updated_at ON organizations;
 CREATE TRIGGER trg_organizations_updated_at BEFORE UPDATE ON organizations FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS locations (
@@ -86,6 +91,7 @@ CREATE TABLE IF NOT EXISTS job_roles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+DROP TRIGGER IF EXISTS trg_job_roles_updated_at ON job_roles;
 CREATE TRIGGER trg_job_roles_updated_at BEFORE UPDATE ON job_roles FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS employees (
@@ -108,8 +114,13 @@ CREATE TABLE IF NOT EXISTS employees (
 );
 CREATE INDEX IF NOT EXISTS idx_employees_manager ON employees(manager_id);
 CREATE INDEX IF NOT EXISTS idx_employees_department ON employees(department_id);
+DROP TRIGGER IF EXISTS trg_employees_updated_at ON employees;
 CREATE TRIGGER trg_employees_updated_at BEFORE UPDATE ON employees FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- Added after employees exists, because departments is created first and the
+-- two reference each other. Dropped first for the same reason as the triggers:
+-- ADD CONSTRAINT has no IF NOT EXISTS.
+ALTER TABLE departments DROP CONSTRAINT IF EXISTS fk_departments_head_employee;
 ALTER TABLE departments
   ADD CONSTRAINT fk_departments_head_employee
   FOREIGN KEY (head_employee_id) REFERENCES employees(id);
@@ -162,6 +173,7 @@ CREATE TABLE IF NOT EXISTS skills (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_skills_category ON skills(category_id);
+DROP TRIGGER IF EXISTS trg_skills_updated_at ON skills;
 CREATE TRIGGER trg_skills_updated_at BEFORE UPDATE ON skills FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS skill_labels (
@@ -310,6 +322,7 @@ CREATE TABLE IF NOT EXISTS training_courses (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+DROP TRIGGER IF EXISTS trg_training_courses_updated_at ON training_courses;
 CREATE TRIGGER trg_training_courses_updated_at BEFORE UPDATE ON training_courses FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS course_modules (
@@ -507,6 +520,7 @@ CREATE TABLE IF NOT EXISTS employee_cv (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+DROP TRIGGER IF EXISTS trg_employee_cv_updated_at ON employee_cv;
 CREATE TRIGGER trg_employee_cv_updated_at BEFORE UPDATE ON employee_cv FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS employee_experience (

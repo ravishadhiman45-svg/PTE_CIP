@@ -15,13 +15,14 @@ import {
   ConfirmDialog,
   Toast,
 } from '@/components/ui';
-import { formatDate, formatMonthYear, statusClasses, durationLabel, LEVEL_TITLES } from '@/lib/ui';
+import { formatDate, formatMonthYear, durationLabel, LEVEL_TITLES } from '@/lib/ui';
 import { useAuth } from '@/components/AuthProvider';
 import ProfileEditModal from '@/components/ProfileEditModal';
 import SelfSkillModal from '@/components/SelfSkillModal';
 import RequestVerificationModal from '@/components/RequestVerificationModal';
+import LearningModuleTab from '@/components/LearningModuleTab';
 
-const TABS = ['Summary', 'Skills Passport', 'Learning Plan', 'Certifications', 'Mentor Notes'];
+const TABS = ['Summary', 'Skills Passport', 'Learning Module', 'Mentor Notes'];
 
 // Full employee profile UI, driven by an employeeId. Shared by /employees/[id]
 // (viewing anyone) and /profile (the logged-in user's own profile).
@@ -69,6 +70,9 @@ export default function EmployeeProfileView({ employeeId }) {
     skillsPassport = [],
     recentLearning = [],
     certifications = [],
+    learningStats = {},
+    enrollments = [],
+    learningTimeline = [],
     mentorNotes = [],
     directReports = [],
     managerChain = [],
@@ -428,7 +432,15 @@ export default function EmployeeProfileView({ employeeId }) {
               </Card>
 
               <Card>
-                <h3 className="mb-3 text-base font-semibold text-white">Recent Learning</h3>
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-base font-semibold text-white">Recent Learning</h3>
+                  <button
+                    className="text-xs text-accent-soft hover:underline"
+                    onClick={() => setTab('Learning Module')}
+                  >
+                    View all →
+                  </button>
+                </div>
                 <div className="space-y-2">
                   {recentLearning.map((l, i) => (
                     <div
@@ -513,51 +525,16 @@ export default function EmployeeProfileView({ employeeId }) {
         </Card>
       ) : null}
 
-      {tab === 'Learning Plan' ? (
-        <Card>
-          <p className="text-sm text-slate-400">
-            View the full Kanban board on the <a href="/learning-plan" className="text-accent-soft">Learning Plan</a> page.
-          </p>
-          <div className="mt-3 space-y-2">
-            {recentLearning.map((l, i) => (
-              <div key={i} className="flex items-center justify-between rounded-lg border border-line bg-ink-900 p-3">
-                <span className="text-sm text-slate-200">{l.title}</span>
-                <Badge className={statusClasses(l.status)}>{l.status}</Badge>
-              </div>
-            ))}
-            {recentLearning.length === 0 ? <p className="text-sm text-slate-500">No learning items.</p> : null}
-          </div>
-        </Card>
-      ) : null}
-
-      {tab === 'Certifications' ? (
-        <Card className="overflow-x-auto p-0">
-          <table className="w-full">
-            <thead className="border-b border-line">
-              <tr>
-                <th className="th">Certification</th>
-                <th className="th">Status</th>
-                <th className="th">Issued</th>
-                <th className="th">Expiry</th>
-                <th className="th">Approved By</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {certifications.map((c, i) => (
-                <tr key={i} className="hover:bg-ink-700/40">
-                  <td className="td text-white">{c.title}</td>
-                  <td className="td"><Badge className={statusClasses(c.status)}>{c.status}</Badge></td>
-                  <td className="td">{formatDate(c.issued_date)}</td>
-                  <td className="td">{formatDate(c.expiry_date)}</td>
-                  <td className="td">{c.approved_by || '—'}</td>
-                </tr>
-              ))}
-              {certifications.length === 0 ? (
-                <tr><td className="td text-slate-500" colSpan={5}>No certifications.</td></tr>
-              ) : null}
-            </tbody>
-          </table>
-        </Card>
+      {tab === 'Learning Module' ? (
+        <LearningModuleTab
+          employeeId={employeeId}
+          canEdit={canEdit}
+          stats={learningStats}
+          timeline={learningTimeline}
+          enrollments={enrollments}
+          certifications={certifications}
+          onChanged={refresh}
+        />
       ) : null}
 
       {tab === 'Mentor Notes' ? (

@@ -77,10 +77,26 @@ async function removePublicFolder(prefix) {
   return removed;
 }
 
+// Deletes specific objects. removePublicFolder() above is the sweep used when a
+// whole folder goes away; this is the single-object case — replacing one
+// certificate file must not touch the rest of that employee's stored files.
+async function removePublicFiles(paths) {
+  if (!supabase || !paths || paths.length === 0) return 0;
+
+  const { error } = await supabase.storage.from(BUCKET).remove(paths);
+  if (error) {
+    const err = new Error(`Could not delete stored files: ${error.message}`);
+    err.status = 502;
+    throw err;
+  }
+  return paths.length;
+}
+
 module.exports = {
   supabase,
   uploadPublicFile,
   removePublicFolder,
+  removePublicFiles,
   BUCKET,
   storageConfigured: configured,
 };
