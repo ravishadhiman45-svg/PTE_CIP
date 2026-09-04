@@ -138,6 +138,35 @@ const Q_GRANT_DEFAULT_ROLE = `INSERT INTO user_permission_role_map (user_id, per
        SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
        ON CONFLICT DO NOTHING`;
 
+// Onboarding course, put on a new hire's Learning Module at creation.
+//
+// db/pg/15_sample_course.sql enrols everyone who existed WHEN IT RAN, which is a
+// one-time snapshot — so before this, anyone added afterwards landed on an empty
+// Learning Module and empty Plan Board, and the only fix was re-running a seed
+// file. Enrolling here covers both the single Add Employee form and the bulk
+// spreadsheet import, since both go through insertEmployee().
+//
+// Matched by course_code, not the seeded uuid: SELECT ... FROM training_courses
+// yields NO ROWS on a database where 15_sample_course.sql was never loaded, so
+// this is a silent no-op there rather than a foreign-key error.
+const Q_ENROL_ONBOARDING = `INSERT INTO training_enrollments
+         (course_id, employee_id, status, progress_percent, enrolled_at)
+       SELECT tc.id, $1, 'Approved', 0, NOW()
+         FROM training_courses tc
+        WHERE tc.course_code = 'PTE-ONB-101'
+       ON CONFLICT (course_id, employee_id) DO NOTHING`;
+
+// ...and on their plan board, so both tabs of the page have content. Mirrors
+// 15_sample_course.sql, which seeds the same pair.
+const Q_PLAN_ONBOARDING = `INSERT INTO learning_plan_items
+         (employee_id, course_id, status, priority, progress_percent, notes)
+       SELECT $1, tc.id, 'To Do', 'High', 0, 'Start here'
+         FROM training_courses tc
+        WHERE tc.course_code = 'PTE-ONB-101'
+          AND NOT EXISTS (
+            SELECT 1 FROM learning_plan_items lpi
+             WHERE lpi.employee_id = $1 AND lpi.course_id = tc.id)`;
+
 // --- Scalar / projection fragments -----------------------------------------
 
 // COUNT(*) is bigint, which the driver returns as a STRING. The ::int cast is
@@ -510,6 +539,11 @@ async function insertEmployee(client, payload) {
     const user = await client.query(Q_INSERT_APP_USER, [created.id, payload.email, payload.full_name]);
     await client.query(Q_GRANT_DEFAULT_ROLE, [user.rows[0].id]);
   }
+
+  // Onboarding content. Inside the caller's transaction on purpose: a rolled-back
+  // employee must not leave an enrolment pointing at nobody.
+  await client.query(Q_ENROL_ONBOARDING, [created.id]);
+  await client.query(Q_PLAN_ONBOARDING, [created.id]);
 
   return created;
 }

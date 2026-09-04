@@ -535,10 +535,50 @@ test('an employee cannot be made to report to themselves', SLOW, async () => {
 });
 
 // ---------------------------------------------------------------------------
+// A new hire's Learning Module
+//
+// db/pg/15_sample_course.sql enrols everyone who existed WHEN IT RAN, so before
+// insertEmployee() did this, anyone added later saw an empty page and the only
+// fix was re-running a seed file.
+// ---------------------------------------------------------------------------
+
+test('a newly added employee lands with the onboarding course, not an empty page', SLOW, async () => {
+  const created = await api('POST', '/api/employees', {
+    body: {
+      employee_code: `PGL${Date.now().toString().slice(-6)}`,
+      full_name: 'Onboarding Probe',
+      email: `onboarding.probe.${Date.now()}@ptecip.local`,
+      manager_id: adminId,
+      org_title: 'TM',
+    },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const newId = created.body.id;
+
+  const lm = ok(await api('GET', `/api/learning-module/${newId}`), 'learning-module for new hire');
+
+  assert.equal(lm.courses.length, 1, 'exactly the onboarding course');
+  assert.equal(lm.courses[0].course_code, 'PTE-ONB-101');
+  assert.equal(lm.courses[0].modules.length, 4, 'its four modules ride along');
+  assert.equal(lm.stats.modules_total, 4);
+  assert.equal(lm.stats.modules_done, 0);
+  assert.equal(lm.stats.active_courses, 1);
+
+  // And the Plan Board tab, which 15_sample_course.sql also seeds.
+  assert.equal(lm.columns['To Do'].length, 1, 'one card on the plan board');
+});
+
+// ---------------------------------------------------------------------------
 // Restart + persistence — the whole point of .pgdata
 // ---------------------------------------------------------------------------
 
+let headcountBeforeRestart;
+
 test('data written before a restart is still there after it', SLOW, async () => {
+  // Captured rather than hard-coded: earlier tests add rows, and what this
+  // asserts is that the count is UNCHANGED by a restart.
+  headcountBeforeRestart = ok(await api('GET', '/api/employees'), 'employees').length;
+
   await stop(child);
   child = null;
 
@@ -567,9 +607,10 @@ test('data written before a restart is still there after it', SLOW, async () => 
 });
 
 test('the restarted server did not re-apply the schema', SLOW, async () => {
-  // 50 employees, not 100: a second run of 02_seed.sql would have doubled them
-  // (its inserts are ON CONFLICT-guarded, but the ledger is what makes this
-  // cheap and certain).
+  // Same headcount, not double it: a second run of 02_seed.sql would have
+  // re-inserted the seed (its rows are ON CONFLICT-guarded, but the ledger is
+  // what makes this cheap and certain).
   const rows = ok(await api('GET', '/api/employees'), 'employees after restart');
-  assert.equal(rows.length, 50);
+  assert.equal(rows.length, headcountBeforeRestart);
+  assert.ok(rows.length >= 50, `expected the seed to still be present, got ${rows.length}`);
 });
