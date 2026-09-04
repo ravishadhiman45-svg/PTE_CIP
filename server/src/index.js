@@ -58,10 +58,16 @@ if (storage.driver === 'localDisk') {
   );
 }
 
-// Health check (public). Reports the resolved dialect and storage driver so an
-// on-premise deployment can be verified without shell access to the box.
+// Health check (public). Reports the resolved database driver and storage
+// driver so a local deployment can be verified without shell access to the box.
 app.get('/api/health', (req, res) =>
-  res.json({ ok: true, service: 'ptecip-api', dialect: db.dialect, storage: storage.driver })
+  res.json({
+    ok: true,
+    service: 'ptecip-api',
+    dialect: db.dialect,
+    driver: db.driver,
+    storage: storage.driver,
+  })
 );
 
 // Auth (public).
@@ -99,21 +105,20 @@ const PORT = process.env.PORT || 4000;
 
 // Verify the database before binding a port.
 //
-// The self-test exercises the three things most likely to be wrong on a fresh
-// on-premise install, in the order they would fail: the connection, boolean and
-// uuid parameter round-tripping, and whether the DDL was ever loaded (the
-// visibility function exists). Discovering any of those from a 500 on request
+// On PG_DRIVER=pglite this is also where the WASM engine boots and db/pg/*.sql
+// is applied to a fresh .pgdata, so the first start takes a few seconds.
+// Discovering a bad connection or an unloaded schema from a 500 on request
 // forty is much worse than refusing to start.
 async function main() {
   try {
     await db.selfTest();
   } catch (err) {
-    console.error(`[startup] database check failed (dialect=${db.dialect})`);
+    console.error(`[startup] database check failed (driver=${db.driver})`);
     console.error(err.message);
     process.exit(1);
   }
 
-  console.log(`[startup] dialect=${db.dialect} storage=${storage.driver}`);
+  console.log(`[startup] db=${db.driver} storage=${storage.driver}`);
 
   app.listen(PORT, () => {
     console.log(`PTE CIP API listening on port ${PORT}`);

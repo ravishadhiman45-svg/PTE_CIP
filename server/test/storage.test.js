@@ -4,8 +4,6 @@
 // routes/employees.js:990), so it is untrusted input reaching a filesystem
 // path. The traversal tests below are the point of this file.
 
-process.env.DB_DIALECT = 'postgres';
-
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');

@@ -59,10 +59,9 @@ async function canView(user, targetId) {
 // The SQL function projects only id/name/title/photo, so there is no column
 // here through which a CV, contact detail or assessment could leak.
 //
-// ORDER BY is here rather than inside the function because a T-SQL inline
-// table-valued function may not contain one. This is the better home for it
-// anyway: "nearest manager first" is a requirement of this caller, and a result
-// set's order was never really guaranteed by a function's internal ORDER BY.
+// ORDER BY is here rather than inside the function: "nearest manager first" is
+// a requirement of this caller, and a result set's order was never really
+// guaranteed by a function's internal ORDER BY anyway.
 async function managerChain(employeeId) {
   const { rows } = await query(
     `SELECT id, full_name, org_title, photo_url, distance

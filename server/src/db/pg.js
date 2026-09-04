@@ -1,5 +1,8 @@
-// PostgreSQL driver. Behaviourally identical to the original src/db.js — this
-// path is the working reference and must not drift.
+// PostgreSQL-over-TCP driver — Supabase, or any Postgres server.
+//
+// This is the REFERENCE implementation: its result shapes are what the Next.js
+// client and every golden snapshot were built against, so it must not drift.
+// db/pglite.js corrects itself towards this file, never the other way round.
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL;

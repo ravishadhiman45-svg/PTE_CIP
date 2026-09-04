@@ -10,3 +10,7 @@ build/
 # Locally stored profile images (STORAGE_DRIVER=localDisk).
 # Back these up with the database — photo_url stores URLs, not bytes.
 server/uploads/
+
+# The local PGlite database (PG_DRIVER=pglite). This IS the offline
+# deployment's data — back it up, but it never belongs in the repo.
+server/.pgdata/

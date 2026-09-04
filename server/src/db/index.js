@@ -1,30 +1,46 @@
 // The data layer. Every route imports from here and from nowhere else.
 //
-// Contract, identical on both dialects:
+// Contract, identical on both drivers:
 //   query(text, params)      -> Promise<{ rows, rowCount }>
 //   withTransaction(fn)      -> fn receives { query(text, params) }
-//   sql({ pg, mssql })       -> the branch for the active dialect
-//   isUniqueViolation(err)   -> dialect-independent error predicates
+//   isUniqueViolation(err)   -> error predicates over Postgres SQLSTATEs
 //
-// SQL is authored in POSTGRES flavour with $n placeholders, everywhere. The
-// translation to T-SQL happens in here, after any caller-side string building —
-// which is what lets lib/visibility.js keep computing placeholder numbers at
-// runtime without knowing the dialect.
+// There is ONE SQL dialect: PostgreSQL, with $n placeholders. PG_DRIVER only
+// chooses where that SQL runs:
 //
-// NOTE: `pool` is deliberately NOT exported. Transactions must go through
-// withTransaction so both drivers can implement their own object model;
+//   server  -> pg.js      Supabase / any Postgres server over TCP
+//   pglite  -> pglite.js  in-process Postgres (WASM) against a local directory
+//
+// Both are real Postgres, so the schema in db/pg/ and every statement in
+// routes/ are shared verbatim. No rewriting, no per-driver SQL.
+//
+// NOTE: the connection pool is deliberately NOT exported. Transactions must go
+// through withTransaction so both drivers can implement their own object model;
 // `grep -rn "pool" src/routes/` should stay empty.
 
-const { dialect, isMssql, isPostgres } = require('./dialect');
-const { sql } = require('./sql');
 const {
   isUniqueViolation,
   isForeignKeyViolation,
   isReportingCycle,
-  CYCLE_ERROR_NUMBER,
 } = require('./errors');
 
-const impl = isMssql ? require('./mssql') : require('./pg');
+// Kept as an explicit setting so a deployment states its intent rather than
+// having it inferred, but there is only one valid value now.
+const dialect = (process.env.DB_DIALECT || 'postgres').trim().toLowerCase();
+if (dialect !== 'postgres') {
+  throw new Error(`[db] DB_DIALECT="${dialect}" is not supported. The only value is: postgres`);
+}
+
+const DRIVERS = ['server', 'pglite'];
+
+const driver = (process.env.PG_DRIVER || 'server').trim().toLowerCase();
+if (!DRIVERS.includes(driver)) {
+  throw new Error(
+    `[db] PG_DRIVER="${driver}" is not recognised. Valid values: ${DRIVERS.join(', ')}`
+  );
+}
+
+const impl = driver === 'pglite' ? require('./pglite') : require('./pg');
 
 module.exports = {
   query: impl.query,
@@ -33,12 +49,10 @@ module.exports = {
   close: impl.close,
 
   dialect,
-  isMssql,
-  isPostgres,
+  driver,
+  DRIVERS,
 
-  sql,
   isUniqueViolation,
   isForeignKeyViolation,
   isReportingCycle,
-  CYCLE_ERROR_NUMBER,
 };

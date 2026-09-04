@@ -7,8 +7,6 @@
 // every avatar silently 404s while every test still passes. This wires the real
 // express.static mount to the real driver and fetches the result.
 
-process.env.DB_DIALECT = 'postgres';
-
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');

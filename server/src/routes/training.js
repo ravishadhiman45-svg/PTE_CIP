@@ -1,73 +1,19 @@
 // Training catalog.
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 
 const router = express.Router();
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL — see server/src/db/sql.js
-// ---------------------------------------------------------------
-
-// A course's skill names as a JSON array. As in routes/skills.js, T-SQL builds
-// it with a correlated FOR JSON PATH rather than aggregating the join fan-out.
-//
-// The shapes differ: pg parses json into an array of strings, while FOR JSON
-// PATH yields objects. Requesting a single unnamed column and using
-// WITHOUT_ARRAY_WRAPPER would give a bare string, so the mssql branch keeps the
-// {name} objects and parseSkillNames() flattens them.
-const COURSE_SKILLS_JSON = sql({
-  pg: `COALESCE(
+// A course's skill names as a JSON array, aggregated so the skill join does not
+// fan the course rows out.
+const COURSE_SKILLS_JSON = `COALESCE(
                 JSON_AGG(DISTINCT s.name) FILTER (WHERE s.id IS NOT NULL), '[]'
-              ) AS skills`,
-  mssql: `COALESCE((
-                SELECT DISTINCT s2.name
-                  FROM course_skill_map csm2
-                  JOIN skills s2 ON s2.id = csm2.skill_id
-                 WHERE csm2.course_id = tc.id
-                 FOR JSON PATH
-              ), '[]') AS skills`,
-});
+              ) AS skills`;
 
-const Q_INSERT_COURSE = sql({
-  pg: `INSERT INTO training_courses
+const Q_INSERT_COURSE = `INSERT INTO training_courses
          (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING id, course_code, title`,
-  // training_courses carries trg_training_courses_updated_at, so OUTPUT has to
-  // go INTO a table variable rather than straight to the caller.
-  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, course_code NVARCHAR(450), title NVARCHAR(450));
-       INSERT INTO training_courses
-         (course_code, title, description, course_type, delivery_mode, duration_hours, difficulty)
-       OUTPUT INSERTED.id, INSERTED.course_code, INSERTED.title INTO @out
-       VALUES ($1,$2,$3,$4,$5,$6,$7);
-       SELECT id, course_code, title FROM @out;`,
-});
-
-// Flattens the skills column to a string array on both dialects: pg already has
-// ["a","b"], FOR JSON PATH gives '[{"name":"a"},{"name":"b"}]'.
-function parseSkillNames(rows) {
-  for (const row of rows) {
-    const v = row.skills;
-    if (Array.isArray(v)) {
-      row.skills = v.map((x) => (x && typeof x === 'object' ? x.name : x)).filter(Boolean);
-      continue;
-    }
-    if (typeof v === 'string' && v.length > 0) {
-      try {
-        const parsed = JSON.parse(v);
-        row.skills = (Array.isArray(parsed) ? parsed : [])
-          .map((x) => (x && typeof x === 'object' ? x.name : x))
-          .filter(Boolean);
-        continue;
-      } catch {
-        // fall through
-      }
-    }
-    row.skills = [];
-  }
-  return rows;
-}
-
+       RETURNING id, course_code, title`;
 
 // GET /api/training?search=&type=&category=
 router.get('/', async (req, res, next) => {
@@ -111,7 +57,7 @@ router.get('/', async (req, res, next) => {
        ORDER BY tc.title`,
       params
     );
-    res.json(parseSkillNames(rows));
+    res.json(rows);
   } catch (err) {
     next(err);
   }

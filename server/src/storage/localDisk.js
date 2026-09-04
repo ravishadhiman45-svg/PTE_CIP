@@ -1,9 +1,9 @@
 // Profile images on the server's own disk, served by Express.
 //
-// This is the on-premise replacement for the Supabase Storage bucket. A client
-// running SQL Server on their own machine generally has no outbound path to
-// Supabase — and if they do, avatar images leaving the premises may itself
-// violate the policy that drove the on-premise requirement in the first place.
+// This is the offline replacement for the Supabase Storage bucket. A machine
+// running the PGlite deployment generally has no outbound path to Supabase —
+// and if it does, avatar images leaving the premises may itself violate the
+// policy that drove the offline requirement in the first place.
 //
 // Same two-function contract as storage/supabase.js, so the call sites in
 // routes/employees.js (:992 upload, :1016 purge) do not change.

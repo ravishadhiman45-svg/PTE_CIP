@@ -5,7 +5,7 @@
 // module checklists (course_modules + enrollment_module_progress, what you are
 // actually working through). The page shows both.
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { requireVisible } = require('../middleware/auth');
 const { isAdmin } = require('../lib/visibility');
 
@@ -14,17 +14,9 @@ const router = express.Router();
 // Enrolments with every module and whether it is ticked. One query — the
 // modules ride along as JSON so the page never has to fan out per course.
 //
-// Same dialect split as LABELS_JSON in routes/skills.js: pg aggregates with
-// json_agg, T-SQL uses a correlated FOR JSON PATH. pg parses the column into a
-// value for us, mssql hands back a string — parseCourseJson() below reconciles
-// both back to the shape the page expects.
-//
-// INCLUDE_NULL_VALUES on the modules subquery is load-bearing: FOR JSON PATH
-// drops null keys by default, and `completed_at: null` is what "not ticked yet"
-// means to the client. Without it an unticked module would come back with no
-// completed_at key at all on SQL Server.
-const COURSES_SQL = sql({
-  pg: `
+// `completed_at: null` is what "not ticked yet" means to the client, so the key
+// has to be present on every module — json_build_object keeps nulls.
+const COURSES_SQL = `
   SELECT te.id, te.course_id, te.status, te.progress_percent, te.score,
          te.enrolled_at, te.completed_at,
          tc.title, tc.course_code, tc.description, tc.course_type, tc.delivery_mode,
@@ -52,48 +44,14 @@ const COURSES_SQL = sql({
   FROM training_enrollments te
   JOIN training_courses tc ON tc.id = te.course_id
   LEFT JOIN employees sme ON sme.id = tc.owner_sme_id
-  WHERE te.employee_id = $1`,
-  mssql: `
-  SELECT te.id, te.course_id, te.status, te.progress_percent, te.score,
-         te.enrolled_at, te.completed_at,
-         tc.title, tc.course_code, tc.description, tc.course_type, tc.delivery_mode,
-         tc.duration_hours, tc.difficulty, tc.cover_image_url,
-         sme.full_name AS owner_sme,
-         COALESCE((
-           SELECT cm.id                 AS id,
-                  cm.module_order        AS module_order,
-                  cm.module_title        AS module_title,
-                  cm.module_description  AS module_description,
-                  cm.duration_minutes    AS duration_minutes,
-                  emp.completed_at       AS completed_at
-           FROM course_modules cm
-           LEFT JOIN enrollment_module_progress emp
-                  ON emp.module_id = cm.id AND emp.enrollment_id = te.id
-           WHERE cm.course_id = tc.id
-           ORDER BY cm.module_order
-           FOR JSON PATH, INCLUDE_NULL_VALUES
-         ), '[]') AS modules,
-         COALESCE((
-           SELECT s.name AS name
-           FROM course_skill_map csm JOIN skills s ON s.id = csm.skill_id
-           WHERE csm.course_id = tc.id
-           ORDER BY s.name
-           FOR JSON PATH
-         ), '[]') AS skills
-  FROM training_enrollments te
-  JOIN training_courses tc ON tc.id = te.course_id
-  LEFT JOIN employees sme ON sme.id = tc.owner_sme_id
-  WHERE te.employee_id = $1`,
-});
+  WHERE te.employee_id = $1`;
 
 // Headline numbers. Module counts come from the join table so they mean
 // "modules actually ticked", not a share of a percentage.
 //
-// pg's count(*) is bigint and would arrive as a string, hence ::int; T-SQL's is
-// already int. duration_hours is NUMERIC, which pg returns as a string either
-// way, so the float cast stays on both sides.
-const STATS_SQL = sql({
-  pg: `SELECT
+// count(*) is bigint and would arrive as a string, hence ::int. duration_hours
+// is NUMERIC, which also arrives as a string, hence ::float.
+const STATS_SQL = `SELECT
          (SELECT count(*)::int FROM enrollment_module_progress emp
             JOIN training_enrollments te ON te.id = emp.enrollment_id
            WHERE te.employee_id = $1)                                             AS modules_done,
@@ -108,76 +66,16 @@ const STATS_SQL = sql({
            WHERE te.employee_id = $1 AND te.status = 'Completed')                 AS completed_courses,
          (SELECT COALESCE(sum(tc.duration_hours),0)::float
             FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
-           WHERE te.employee_id = $1 AND te.status = 'Completed')                 AS hours_done`,
-  mssql: `SELECT
-         (SELECT count(*) FROM enrollment_module_progress emp
-            JOIN training_enrollments te ON te.id = emp.enrollment_id
-           WHERE te.employee_id = $1)                                             AS modules_done,
-         (SELECT count(*) FROM course_modules cm
-            JOIN training_enrollments te ON te.course_id = cm.course_id
-           WHERE te.employee_id = $1
-             AND te.status IN ('Nominated','Approved','In Progress','Completed')) AS modules_total,
-         (SELECT count(*) FROM training_enrollments te
-           WHERE te.employee_id = $1
-             AND te.status IN ('Nominated','Approved','In Progress'))             AS active_courses,
-         (SELECT count(*) FROM training_enrollments te
-           WHERE te.employee_id = $1 AND te.status = 'Completed')                 AS completed_courses,
-         (SELECT CAST(COALESCE(sum(tc.duration_hours),0) AS float)
-            FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
-           WHERE te.employee_id = $1 AND te.status = 'Completed')                 AS hours_done`,
-});
+           WHERE te.employee_id = $1 AND te.status = 'Completed')                 AS hours_done`;
 
-// Ticking a module. pg's ON CONFLICT DO NOTHING is atomic; the T-SQL form needs
-// UPDLOCK/HOLDLOCK on the existence check to be, or two concurrent ticks of the
-// same module both see "absent" and one hits the primary key. Same idiom as
-// Q_ENSURE_CV in routes/employees.js.
-const Q_TICK_MODULE = sql({
-  pg: `INSERT INTO enrollment_module_progress (enrollment_id, module_id)
-       VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-  mssql: `INSERT INTO enrollment_module_progress (enrollment_id, module_id)
-          SELECT $1,$2 WHERE NOT EXISTS (
-            SELECT 1 FROM enrollment_module_progress WITH (UPDLOCK, HOLDLOCK)
-             WHERE enrollment_id = $1 AND module_id = $2)`,
-});
+// Ticking a module. ON CONFLICT DO NOTHING is what makes a double-tick a no-op
+// rather than a primary-key violation.
+const Q_TICK_MODULE = `INSERT INTO enrollment_module_progress (enrollment_id, module_id)
+       VALUES ($1,$2) ON CONFLICT DO NOTHING`;
 
 // Recomputes training_enrollments.progress_percent from the ticked share.
-//
-// The Postgres side is a plpgsql FUNCTION; T-SQL scalar functions cannot perform
-// DML, so the SQL Server tree ships it as a stored PROCEDURE instead (see
-// db/mssql/14_module_progress.sql) and the call becomes an EXEC. The rewriter
-// cannot see this — nothing in `SELECT sync_enrollment_progress($1)` is a
-// forbidden token — so it has to be written out here.
-const Q_SYNC_PROGRESS = sql({
-  pg: 'SELECT sync_enrollment_progress($1)',
-  mssql: 'EXEC dbo.sync_enrollment_progress $1',
-});
-
-// pg parses a json column into a value; FOR JSON PATH returns a string, and NULL
-// rather than '[]' when the subquery matched nothing. `skills` also differs in
-// shape: pg builds ["a","b"], FOR JSON PATH can only build objects, so it gives
-// [{"name":"a"},{"name":"b"}] and gets flattened back here.
-function parseCourseJson(rows) {
-  const toArray = (v) => {
-    if (Array.isArray(v)) return v;
-    if (typeof v === 'string' && v.length > 0) {
-      try {
-        const parsed = JSON.parse(v);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
-    }
-    return [];
-  };
-
-  for (const row of rows) {
-    row.modules = toArray(row.modules);
-    row.skills = toArray(row.skills)
-      .map((x) => (x && typeof x === 'object' ? x.name : x))
-      .filter(Boolean);
-  }
-  return rows;
-}
+// Defined in db/pg/14_module_progress.sql.
+const Q_SYNC_PROGRESS = 'SELECT sync_enrollment_progress($1)';
 
 // GET /api/learning-module/:employeeId
 router.get('/:employeeId', requireVisible('employeeId'), async (req, res, next) => {
@@ -218,7 +116,7 @@ router.get('/:employeeId', requireVisible('employeeId'), async (req, res, next) 
     const columns = { 'To Do': [], 'In Progress': [], Completed: [], Archived: [] };
     for (const r of plan.rows) if (columns[r.status]) columns[r.status].push(r);
 
-    res.json({ courses: parseCourseJson(courses.rows), stats: stats.rows[0], columns });
+    res.json({ courses: courses.rows, stats: stats.rows[0], columns });
   } catch (err) {
     next(err);
   }
@@ -245,7 +143,7 @@ async function ownedEnrollment(req, res) {
 // The course as the page needs to redraw it, after a tick.
 async function courseAfterChange(employeeId, enrollmentId) {
   const { rows } = await query(`${COURSES_SQL} AND te.id = $2`, [employeeId, enrollmentId]);
-  return parseCourseJson(rows)[0] || null;
+  return rows[0] || null;
 }
 
 // The module must belong to this enrolment's course — otherwise a valid

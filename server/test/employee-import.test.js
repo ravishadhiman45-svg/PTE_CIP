@@ -5,8 +5,6 @@
 // path an admin takes. A test that hand-built a workbook instead would keep
 // passing after the template's headers drifted away from the parser's.
 
-process.env.DB_DIALECT = 'postgres';
-
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const ExcelJS = require('exceljs');

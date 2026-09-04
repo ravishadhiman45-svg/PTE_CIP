@@ -1,9 +1,7 @@
 -- =============================================================
 -- PTE CIP — STARTER COURSE FOR EVERY EMPLOYEE
 -- Additive migration. Safe to re-run (idempotent).
--- Run in the Supabase SQL Editor after 14_module_progress.sql.
--- PostgreSQL syntax (ON CONFLICT, EXCLUDED, ADD COLUMN IF NOT EXISTS) — a
--- T-SQL linter will flag these; they are correct here.
+-- Run after 14_module_progress.sql.
 --
 -- Nothing in the app can create a training_enrollments row yet: enrolment and
 -- nomination have no UI, so the Learning Module page is empty for everyone

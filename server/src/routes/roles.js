@@ -1,36 +1,19 @@
 // Job roles list + role detail (mandatory skills + people readiness).
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL — see server/src/db/sql.js
-// ---------------------------------------------------------------
-
-// COUNT(*) FILTER (WHERE p) -> COUNT(CASE WHEN p THEN 1 END).
-//
-// The CASE form works on Postgres too, but FILTER is the clearer idiom there
-// and this keeps the pg branch byte-identical to what shipped.
-const READINESS_BUCKETS = sql({
-  pg: `COUNT(*) FILTER (WHERE readiness_percent >= 100) AS ready_now,
+// Readiness split into the four bands the role page shows.
+const READINESS_BUCKETS = `COUNT(*) FILTER (WHERE readiness_percent >= 100) AS ready_now,
          COUNT(*) FILTER (WHERE readiness_percent >= 75 AND readiness_percent < 100) AS ready_3m,
          COUNT(*) FILTER (WHERE readiness_percent >= 50 AND readiness_percent < 75) AS ready_6m,
-         COUNT(*) FILTER (WHERE readiness_percent < 50) AS not_ready,`,
-  mssql: `COUNT(CASE WHEN readiness_percent >= 100 THEN 1 END) AS ready_now,
-         COUNT(CASE WHEN readiness_percent >= 75 AND readiness_percent < 100 THEN 1 END) AS ready_3m,
-         COUNT(CASE WHEN readiness_percent >= 50 AND readiness_percent < 75 THEN 1 END) AS ready_6m,
-         COUNT(CASE WHEN readiness_percent < 50 THEN 1 END) AS not_ready,`,
-});
+         COUNT(*) FILTER (WHERE readiness_percent < 50) AS not_ready,`;
 
-// COUNT(e.id) FILTER (...) counts non-null e.id among matching rows, so the CASE
-// must yield e.id — not 1 — or an outer-joined miss would be counted.
-const MEETING_COUNT = sql({
-  pg: 'COUNT(e.id) FILTER (WHERE COALESCE(m.effective_level, 0) >= b.required_level)',
-  mssql: 'COUNT(CASE WHEN COALESCE(m.effective_level, 0) >= b.required_level THEN e.id END)',
-});
-
+// COUNT(e.id), not COUNT(*): e comes from a LEFT JOIN, so an outer-joined miss
+// must not be counted as a person meeting the benchmark.
+const MEETING_COUNT = 'COUNT(e.id) FILTER (WHERE COALESCE(m.effective_level, 0) >= b.required_level)';
 
 // GET /api/roles
 //

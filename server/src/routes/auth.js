@@ -3,7 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { JWT_SECRET } = require('../middleware/auth');
 
 const router = express.Router();
@@ -24,19 +24,8 @@ function passwordMatches(supplied) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// The permission roles for one employee, as a `roles` value.
-//
-// Postgres aggregates the joined rows with ARRAY_AGG(DISTINCT ...) FILTER.
-// T-SQL has neither ARRAY_AGG nor FILTER, and — importantly — does not accept
-// STRING_AGG(DISTINCT ...) either, so the DISTINCT has to happen in a derived
-// table. Doing that as a correlated subquery also removes the three role joins
-// and the GROUP BY from the mssql branch entirely, which is simpler than the
-// original: the joins only existed to be collapsed again.
-//
-// The branches return DIFFERENT shapes — a real array on pg, a comma-separated
-// string on SQL Server — which toRoleArray() below reconciles.
-const Q_LOOKUP_EMPLOYEE = sql({
-  pg: `SELECT e.id AS employee_id, e.full_name, e.email, e.job_role_id,
+// The permission roles for one employee, as a `roles` array.
+const Q_LOOKUP_EMPLOYEE = `SELECT e.id AS employee_id, e.full_name, e.email, e.job_role_id,
             e.photo_url, e.org_title,
             jr.role_name AS job_role_name, d.name AS department_name,
             COALESCE(
@@ -51,34 +40,15 @@ const Q_LOOKUP_EMPLOYEE = sql({
      LEFT JOIN app_permission_roles pr ON pr.id = m.permission_role_id
      WHERE lower(e.email) = lower($1)
      GROUP BY e.id, e.full_name, e.email, e.job_role_id, e.photo_url, e.org_title,
-              jr.role_name, d.name`,
-  mssql: `SELECT e.id AS employee_id, e.full_name, e.email, e.job_role_id,
-            e.photo_url, e.org_title,
-            jr.role_name AS job_role_name, d.name AS department_name,
-            (SELECT STRING_AGG(x.role_key, ',') FROM (
-               SELECT DISTINCT pr.role_key
-                 FROM app_users au
-                 JOIN user_permission_role_map m ON m.user_id = au.id
-                 JOIN app_permission_roles pr ON pr.id = m.permission_role_id
-                WHERE au.employee_id = e.id AND pr.role_key IS NOT NULL
-             ) x) AS roles
-     FROM employees e
-     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-     LEFT JOIN departments d ON d.id = e.department_id
-     WHERE lower(e.email) = lower($1)`,
-});
+              jr.role_name, d.name`;
 
-// Normalises the `roles` column to a string array whichever driver produced it.
+// Fails closed on anything that is not an array.
 //
-// This must never return a bare string: lib/visibility.js:27 guards with
+// Load-bearing rather than defensive noise: lib/visibility.js guards with
 // Array.isArray precisely because String.prototype.includes does SUBSTRING
-// matching, which would make "not-an-admin" satisfy includes('admin').
+// matching, which would make a bare "not-an-admin" satisfy includes('admin').
 function toRoleArray(value) {
-  if (Array.isArray(value)) return value.filter(Boolean);
-  if (typeof value === 'string' && value.length > 0) {
-    return value.split(',').map((s) => s.trim()).filter(Boolean);
-  }
-  return [];
+  return Array.isArray(value) ? value.filter(Boolean) : [];
 }
 
 // Returns the employee row (with a `roles` array) or null if the email is unknown.

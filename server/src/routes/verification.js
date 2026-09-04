@@ -11,50 +11,24 @@
 // employee, who has none. Verification now goes UP the chain instead, which is
 // also the direction it means something.
 const express = require('express');
-const { query, withTransaction, sql } = require('../db');
+const { query, withTransaction } = require('../db');
 
 const router = express.Router();
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL — see server/src/db/sql.js
-// ---------------------------------------------------------------
+// ON CONFLICT DO NOTHING is what makes this atomic: two concurrent callers must
+// not both see "absent" and have one then hit the primary key.
+const Q_ENSURE_CV = 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING';
 
-// UPDLOCK/HOLDLOCK on the existence check makes this atomic, which is what
-// ON CONFLICT DO NOTHING gives for free. Without the hint two concurrent
-// callers can both see "absent" and one then hits a primary-key violation.
-const Q_ENSURE_CV = sql({
-  pg: 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
-  mssql: `INSERT INTO employee_cv (employee_id)
-          SELECT $1 WHERE NOT EXISTS (
-            SELECT 1 FROM employee_cv WITH (UPDLOCK, HOLDLOCK) WHERE employee_id = $1)`,
-});
-
-// Note $2 appears TWICE — as requested_by and as entity_id. Named parameters
-// make that free on SQL Server; a positional `?` conversion would have needed
-// the value duplicated in the params array.
-const Q_INSERT_APPROVAL = sql({
-  pg: `INSERT INTO approvals
+// Note $2 appears TWICE — as requested_by and as entity_id.
+const Q_INSERT_APPROVAL = `INSERT INTO approvals
            (approval_type, requested_by, approver_id, entity_type, entity_id, status)
          VALUES ($1,$2,$3,'employee_cv',$2,'Pending')
-         RETURNING id, approval_type, status, requested_at`,
-  mssql: `INSERT INTO approvals
-           (approval_type, requested_by, approver_id, entity_type, entity_id, status)
-         OUTPUT INSERTED.id, INSERTED.approval_type, INSERTED.status, INSERTED.requested_at
-         VALUES ($1,$2,$3,'employee_cv',$2,'Pending')`,
-});
+         RETURNING id, approval_type, status, requested_at`;
 
-const Q_DECIDE_APPROVAL = sql({
-  pg: `UPDATE approvals
+const Q_DECIDE_APPROVAL = `UPDATE approvals
             SET status = $2, decision_comments = COALESCE($3, decision_comments), decided_at = NOW()
           WHERE id = $1
-          RETURNING id, approval_type, status, decision_comments, decided_at`,
-  mssql: `UPDATE approvals
-            SET status = $2, decision_comments = COALESCE($3, decision_comments), decided_at = SYSUTCDATETIME()
-          OUTPUT INSERTED.id, INSERTED.approval_type, INSERTED.status,
-                 INSERTED.decision_comments, INSERTED.decided_at
-          WHERE id = $1`,
-});
-
+          RETURNING id, approval_type, status, decision_comments, decided_at`;
 
 const APPROVAL_TYPE = 'Profile Verification';
 

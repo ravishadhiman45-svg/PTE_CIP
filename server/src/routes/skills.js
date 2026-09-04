@@ -4,94 +4,32 @@
 // cares about, not people. Any per-employee count or list rolled up alongside it
 // is scoped to the caller's subtree.
 const express = require('express');
-const { query, withTransaction, sql, isUniqueViolation } = require('../db');
+const { query, withTransaction, isUniqueViolation } = require('../db');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const { insertDefaultLevelDefinitions } = require('../lib/skillLevels');
 
 const router = express.Router();
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL — see server/src/db/sql.js
-// ---------------------------------------------------------------
-
-// A skill's label chips, as a JSON array.
-//
-// Postgres aggregates them with JSON_AGG ... FILTER over the joined rows.
-// T-SQL has neither, so it uses a correlated FOR JSON PATH subquery — which is
-// arguably clearer, since the labels are 1:N with the skill and were only being
-// aggregated to undo the join fan-out in the first place.
-//
-// The two return DIFFERENT JS types: pg parses json/jsonb into an array, while
-// FOR JSON PATH hands back a string. parseJsonColumn() below reconciles that,
-// so the API response is identical either way.
-const LABELS_JSON = sql({
-  pg: `COALESCE(
+// A skill's label chips, as a JSON array, aggregated to undo the label join's
+// fan-out.
+const LABELS_JSON = `COALESCE(
                 JSON_AGG(DISTINCT jsonb_build_object('name', sl.label_name, 'color', sl.label_color))
                   FILTER (WHERE sl.id IS NOT NULL),
                 '[]'
-              ) AS labels`,
-  mssql: `COALESCE((
-                SELECT DISTINCT sl2.label_name AS name, sl2.label_color AS color
-                  FROM skill_label_map slm2
-                  JOIN skill_labels sl2 ON sl2.id = slm2.label_id
-                 WHERE slm2.skill_id = s.id
-                 FOR JSON PATH
-              ), '[]') AS labels`,
-});
+              ) AS labels`;
 
-// ROUND(AVG(x)::numeric, 1) -> ROUND(AVG(CAST(x AS decimal(10,2))), 1).
-// The cast is what stops integer division truncating the average; T-SQL has the
-// same hazard, so the cast has to survive translation rather than be dropped.
-const AVG_LEVEL_SCOPED = sql({
-  pg: 'ROUND(AVG(effective_level)::numeric, 1)',
-  mssql: 'ROUND(AVG(CAST(effective_level AS decimal(10,2))), 1)',
-});
-const AVG_REQUIRED = sql({
-  pg: 'ROUND(AVG(required_level)::numeric, 1)',
-  mssql: 'ROUND(AVG(CAST(required_level AS decimal(10,2))), 1)',
-});
+// The ::numeric cast is what stops integer division truncating the average.
+const AVG_LEVEL_SCOPED = 'ROUND(AVG(effective_level)::numeric, 1)';
+const AVG_REQUIRED = 'ROUND(AVG(required_level)::numeric, 1)';
 
-const Q_INSERT_CATEGORY = sql({
-  pg: `INSERT INTO skill_categories (code, name, description)
+const Q_INSERT_CATEGORY = `INSERT INTO skill_categories (code, name, description)
        VALUES ($1, $2, $3)
-       RETURNING id, code, name, description`,
-  mssql: `INSERT INTO skill_categories (code, name, description)
-          OUTPUT INSERTED.id, INSERTED.code, INSERTED.name, INSERTED.description
-          VALUES ($1, $2, $3)`,
-});
+       RETURNING id, code, name, description`;
 
-const Q_INSERT_SKILL_FULL = sql({
-  pg: `INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
+const Q_INSERT_SKILL_FULL = `INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
        VALUES ($1,$2,$3,$4,COALESCE($5,'Medium'),COALESCE($6,'Medium'))
-       RETURNING id, code, name`,
-  // skills carries trg_skills_updated_at, so OUTPUT has to go INTO a table
-  // variable rather than straight to the caller.
-  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, code NVARCHAR(450), name NVARCHAR(450));
-          INSERT INTO skills (code, name, category_id, description, criticality, future_relevance)
-          OUTPUT INSERTED.id, INSERTED.code, INSERTED.name INTO @out
-          VALUES ($1,$2,$3,$4,COALESCE($5,'Medium'),COALESCE($6,'Medium'));
-          SELECT id, code, name FROM @out;`,
-});
-
-// Turns a JSON column into a parsed value regardless of which driver produced
-// it. pg hands back an array already; FOR JSON PATH hands back a string, and
-// returns NULL rather than '[]' when the subquery matched nothing.
-function parseJsonColumn(rows, column, fallback = []) {
-  for (const row of rows) {
-    const v = row[column];
-    if (v === null || v === undefined) {
-      row[column] = fallback;
-    } else if (typeof v === 'string') {
-      try {
-        row[column] = JSON.parse(v);
-      } catch {
-        row[column] = fallback;
-      }
-    }
-  }
-  return rows;
-}
+       RETURNING id, code, name`;
 
 // GET /api/skills?search=&category=&label=
 router.get('/', async (req, res, next) => {
@@ -139,7 +77,7 @@ router.get('/', async (req, res, next) => {
        ORDER BY s.name`,
       params
     );
-    res.json(parseJsonColumn(rows, 'labels'));
+    res.json(rows);
   } catch (err) {
     next(err);
   }

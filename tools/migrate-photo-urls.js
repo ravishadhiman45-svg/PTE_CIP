@@ -6,7 +6,7 @@
 // photo_url stores an ABSOLUTE url, so switching STORAGE_DRIVER does not move
 // existing pictures — the rows keep pointing at
 // https://<project>.supabase.co/storage/v1/object/public/avatars/<id>/<file>.
-// On an on-premise install that host is usually unreachable, so every avatar
+// On an offline install that host is usually unreachable, so every avatar
 // that already existed silently degrades to initials while newly uploaded ones
 // work. The failure is quiet and easy to mistake for "the upload feature is
 // broken".
@@ -23,7 +23,13 @@
 //
 // Dry run is the default deliberately: this rewrites a column in place.
 
-require('dotenv').config({ path: require('path').resolve(__dirname, '../server/.env') });
+// Dependencies live in server/node_modules, and node resolves from THIS file's
+// directory upward — which never reaches it. So dotenv is resolved explicitly.
+// ../server/src/db needs no help: its own requires resolve from server/.
+const SERVER_DIR = require('path').resolve(__dirname, '../server');
+const dotenv = require(require.resolve('dotenv', { paths: [SERVER_DIR] }));
+
+dotenv.config({ path: require('path').join(SERVER_DIR, '.env') });
 
 const fs = require('fs/promises');
 const path = require('path');
@@ -33,9 +39,12 @@ const DOWNLOAD = process.argv.includes('--download');
 
 const db = require('../server/src/db');
 
-const UPLOAD_DIR = path.resolve(
-  process.env.UPLOAD_DIR || path.join(__dirname, '../server/uploads')
-);
+// Relative to server/, NOT to the working directory — the same rule
+// storage/localDisk.js applies. path.resolve() against cwd would write the
+// avatars into a second folder the running API never reads from.
+const UPLOAD_DIR = process.env.UPLOAD_DIR
+  ? path.resolve(SERVER_DIR, process.env.UPLOAD_DIR)
+  : path.join(SERVER_DIR, 'uploads');
 const BASE_URL = (process.env.PUBLIC_FILE_BASE_URL || 'http://localhost:4000/files').replace(
   /\/+$/,
   ''
@@ -73,7 +82,7 @@ async function download(url, key) {
 }
 
 async function main() {
-  console.log(`dialect     : ${db.dialect}`);
+  console.log(`db driver   : ${db.driver}`);
   console.log(`upload dir  : ${UPLOAD_DIR}`);
   console.log(`new base    : ${BASE_URL}`);
   console.log(`mode        : ${APPLY ? 'APPLY' : 'dry run'}${DOWNLOAD ? ' + download' : ''}\n`);

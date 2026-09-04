@@ -2,48 +2,17 @@
 // Derives current vs required capability per skill area for 2026 / 2028 / 2032
 // from each category's average assessed level and future_relevance.
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL — see server/src/db/sql.js
-// ---------------------------------------------------------------
+// The most common future_relevance in the group. MODE() picks an arbitrary
+// winner among equally-frequent values, which is acceptable here: the horizons
+// table below buckets relevance coarsely.
+const DOMINANT_RELEVANCE = 'MODE() WITHIN GROUP (ORDER BY s.future_relevance)';
 
-// MODE() WITHIN GROUP is a Postgres ordered-set aggregate with no T-SQL
-// counterpart at all. The equivalent is "the most common value in the group",
-// which becomes a correlated TOP 1 ... GROUP BY ... ORDER BY COUNT(*) DESC.
-//
-// The tie-break differs: Postgres's MODE() picks an arbitrary winner among
-// equally-frequent values, so the secondary ORDER BY here makes the T-SQL
-// version DETERMINISTIC rather than merely matching. That is a deliberate
-// improvement, not an accident — but it means the two can legitimately disagree
-// on a tie, which is worth knowing when diffing outputs.
-// The correlation is on sc.NAME, not sc.id, and that is load-bearing rather
-// than a stylistic choice. The outer query groups by sc.name alone, so sc.id is
-// not available to a correlated subquery — referencing it fails with "invalid in
-// the select list because it is not contained in either an aggregate function or
-// the GROUP BY clause". Correlating on the grouping key also keeps the
-// granularity honest: two categories sharing a name are one row in the outer
-// query, so the mode must be computed over both of them together.
-const DOMINANT_RELEVANCE = sql({
-  pg: 'MODE() WITHIN GROUP (ORDER BY s.future_relevance)',
-  mssql: `(SELECT TOP 1 s2.future_relevance
-                 FROM skills s2
-                 JOIN skill_categories sc2 ON sc2.id = s2.category_id
-                WHERE sc2.name = sc.name AND s2.future_relevance IS NOT NULL
-                GROUP BY s2.future_relevance
-                ORDER BY COUNT(*) DESC, s2.future_relevance)`,
-});
-
-// BOOL_OR(p) -> MAX(CASE WHEN p THEN 1 ELSE 0 END), compared to produce a real
-// boolean so the JSON stays true/false rather than 1/0.
-const IS_STRATEGIC = sql({
-  pg: "BOOL_OR(s.criticality IN ('High','Critical'))",
-  mssql: `CAST(MAX(CASE WHEN s.criticality IN ('High','Critical') THEN 1 ELSE 0 END) AS bit)`,
-});
-
+const IS_STRATEGIC = "BOOL_OR(s.criticality IN ('High','Critical'))";
 
 // future_relevance → target capability (%) by horizon.
 const REQUIRED_BY_RELEVANCE = {

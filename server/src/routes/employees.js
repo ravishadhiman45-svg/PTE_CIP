@@ -2,7 +2,7 @@
 // and the self-service CV editing endpoints.
 const express = require('express');
 const multer = require('multer');
-const { query, withTransaction, sql, isUniqueViolation, isReportingCycle } = require('../db');
+const { query, withTransaction, isUniqueViolation, isReportingCycle } = require('../db');
 const { requireRole, requireSelfOrAdmin, requireVisible } = require('../middleware/auth');
 const { visibleIdsSql, canView, managerChain } = require('../lib/visibility');
 const { streamCvPdf, cvFileName } = require('../lib/cvPdf');
@@ -113,208 +113,72 @@ function uploadSheet(req, res, next) {
 
 // Dates are projected as plain YYYY-MM-DD strings rather than timestamps, so the
 // client never has to reason about timezones for a date-only field.
-const EXPERIENCE_COLUMNS = sql({
-  pg: `id, title, organization,
+const EXPERIENCE_COLUMNS = `id, title, organization,
   to_char(start_date, 'YYYY-MM-DD') AS start_date,
   to_char(end_date, 'YYYY-MM-DD') AS end_date,
-  description, sort_order`,
-  // CONVERT style 23 is ISO yyyy-mm-dd.
-  mssql: `id, title, organization,
-  CONVERT(varchar(10), start_date, 23) AS start_date,
-  CONVERT(varchar(10), end_date, 23) AS end_date,
-  description, sort_order`,
-});
+  description, sort_order`;
 
 const EDUCATION_COLUMNS =
   'id, degree, institution, field_of_study, start_year, end_year, grade, sort_order';
 
-// ---------------------------------------------------------------
-// Dialect-divergent SQL
-//
-// These statements use Postgres constructs with no token-level T-SQL
-// equivalent, so each is written out per dialect. Both branches take the SAME
-// params array, and both still go through the rewriter ($n -> @pn, dbo.
-// qualification, boolean marshalling) — only the STRUCTURE is overridden.
-//
-// The T-SQL conditional inserts use WITH (UPDLOCK, HOLDLOCK) on the existence
-// check. That is the standard idiom for a race-free "insert if absent": a bare
-// NOT EXISTS lets two concurrent callers both see "absent" and one then hits a
-// primary-key violation, whereas ON CONFLICT DO NOTHING is atomic. The locking
-// hint restores the atomicity the Postgres version had.
-// ---------------------------------------------------------------
+const Q_ENSURE_CV = 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING';
 
-const Q_ENSURE_CV = sql({
-  pg: 'INSERT INTO employee_cv (employee_id) VALUES ($1) ON CONFLICT (employee_id) DO NOTHING',
-  mssql: `INSERT INTO employee_cv (employee_id)
-          SELECT $1 WHERE NOT EXISTS (
-            SELECT 1 FROM employee_cv WITH (UPDLOCK, HOLDLOCK) WHERE employee_id = $1)`,
-});
-
-const Q_INSERT_EMPLOYEE = sql({
-  pg: `INSERT INTO employees
+const Q_INSERT_EMPLOYEE = `INSERT INTO employees
          (employee_code, full_name, email, gender, grade, joining_date,
           department_id, team_id, job_role_id, manager_id, location_id, org_title,
           sibling_order)
        VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
           COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1))
-       RETURNING id, employee_code, full_name, email, org_title`,
-  // OUTPUT must go INTO a table variable here, not straight to the caller.
-  //
-  // SQL Server refuses "OUTPUT without INTO" on any table carrying an enabled
-  // trigger, and `employees` has two (trg_employees_updated_at and
-  // trg_employees_no_cycle). The error is explicit about it:
-  //   "The target table ... cannot have any enabled triggers if the statement
-  //    contains an OUTPUT clause without INTO clause."
-  // So the rows are captured into @out and selected back, which is permitted.
-  // The trailing SELECT is what the driver returns as the recordset.
-  mssql: `DECLARE @out TABLE (
-            id UNIQUEIDENTIFIER, employee_code NVARCHAR(450), full_name NVARCHAR(450),
-            email NVARCHAR(450), org_title NVARCHAR(450));
-       INSERT INTO employees
-         (employee_code, full_name, email, gender, grade, joining_date,
-          department_id, team_id, job_role_id, manager_id, location_id, org_title,
-          sibling_order)
-       OUTPUT INSERTED.id, INSERTED.employee_code, INSERTED.full_name,
-              INSERTED.email, INSERTED.org_title
-         INTO @out
-       VALUES ($1,$2,$3,COALESCE($4,'Not Specified'),$5,$6,$7,$8,$9,$10,$11,$12,
-          COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $10), 1));
-       SELECT id, employee_code, full_name, email, org_title FROM @out;`,
-});
+       RETURNING id, employee_code, full_name, email, org_title`;
 
-const Q_INSERT_APP_USER = sql({
-  pg: `INSERT INTO app_users (employee_id, email, display_name)
-       VALUES ($1,$2,$3) RETURNING id`,
-  mssql: `INSERT INTO app_users (employee_id, email, display_name)
-          OUTPUT INSERTED.id
-          VALUES ($1,$2,$3)`,
-});
+const Q_INSERT_APP_USER = `INSERT INTO app_users (employee_id, email, display_name)
+       VALUES ($1,$2,$3) RETURNING id`;
 
-const Q_GRANT_DEFAULT_ROLE = sql({
-  pg: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
+const Q_GRANT_DEFAULT_ROLE = `INSERT INTO user_permission_role_map (user_id, permission_role_id)
        SELECT $1, id FROM app_permission_roles WHERE role_key = 'employee'
-       ON CONFLICT DO NOTHING`,
-  mssql: `INSERT INTO user_permission_role_map (user_id, permission_role_id)
-          SELECT $1, pr.id FROM app_permission_roles pr
-           WHERE pr.role_key = 'employee'
-             AND NOT EXISTS (
-               SELECT 1 FROM user_permission_role_map m WITH (UPDLOCK, HOLDLOCK)
-                WHERE m.user_id = $1 AND m.permission_role_id = pr.id)`,
-});
-
+       ON CONFLICT DO NOTHING`;
 
 // --- Scalar / projection fragments -----------------------------------------
 
-// COUNT(*) is bigint, which pg returns as a STRING. The ::int cast is what
-// makes it a JS number, and T-SQL needs the same cast for the same reason.
-const DIRECT_REPORTS_COUNT = sql({
-  pg: '(SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id)',
-  mssql: '(SELECT CAST(count(*) AS int) FROM employees c WHERE c.manager_id = e.id)',
-});
-const SUBTREE_COUNT = sql({
-  pg: '(SELECT count(*)::int FROM employee_subtree(e.id))',
-  mssql: '(SELECT CAST(count(*) AS int) FROM dbo.employee_subtree(e.id))',
-});
+// COUNT(*) is bigint, which the driver returns as a STRING. The ::int cast is
+// what makes it a JS number.
+const DIRECT_REPORTS_COUNT = '(SELECT count(*)::int FROM employees c WHERE c.manager_id = e.id)';
+const SUBTREE_COUNT = '(SELECT count(*)::int FROM employee_subtree(e.id))';
 
-// LIMIT 1 inside a CORRELATED SCALAR SUBQUERY — the shape the rewriter refuses
-// to touch, because relocating the token to TOP would bind it to the outer
-// SELECT and silently truncate the whole result set.
-const ACTIVE_MENTOR_NAME = sql({
-  pg: `(SELECT me.full_name FROM mentor_assignments ma
+const ACTIVE_MENTOR_NAME = `(SELECT me.full_name FROM mentor_assignments ma
                JOIN employees me ON me.id = ma.mentor_id
                WHERE ma.mentee_id = e.id AND ma.status = 'Active'
-               ORDER BY ma.start_date ASC LIMIT 1)`,
-  mssql: `(SELECT TOP 1 me.full_name FROM mentor_assignments ma
-               JOIN employees me ON me.id = ma.mentor_id
-               WHERE ma.mentee_id = e.id AND ma.status = 'Active'
-               ORDER BY ma.start_date ASC)`,
-});
+               ORDER BY ma.start_date ASC LIMIT 1)`;
 
-const LATEST_TARGET_ROLE = sql({
-  pg: `(SELECT jr2.role_name FROM mentor_recommendations mr
+const LATEST_TARGET_ROLE = `(SELECT jr2.role_name FROM mentor_recommendations mr
                JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
                WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
-               ORDER BY mr.submitted_at DESC LIMIT 1)`,
-  mssql: `(SELECT TOP 1 jr2.role_name FROM mentor_recommendations mr
-               JOIN job_roles jr2 ON jr2.id = mr.recommended_role_id
-               WHERE mr.employee_id = e.id AND mr.recommended_role_id IS NOT NULL
-               ORDER BY mr.submitted_at DESC)`,
-});
+               ORDER BY mr.submitted_at DESC LIMIT 1)`;
 
-const PENDING_APPROVER = sql({
-  pg: `(SELECT ap.full_name FROM approvals a
+const PENDING_APPROVER = `(SELECT ap.full_name FROM approvals a
                JOIN employees ap ON ap.id = a.approver_id
                WHERE a.approval_type = 'Profile Verification'
                  AND a.entity_id = e.id AND a.status = 'Pending'
-               ORDER BY a.requested_at DESC LIMIT 1)`,
-  mssql: `(SELECT TOP 1 ap.full_name FROM approvals a
-               JOIN employees ap ON ap.id = a.approver_id
-               WHERE a.approval_type = 'Profile Verification'
-                 AND a.entity_id = e.id AND a.status = 'Pending'
-               ORDER BY a.requested_at DESC)`,
-});
-
-// Projection lists reused by the OUTPUT clauses below. OUTPUT accepts
-// expressions over INSERTED columns, so the date formatting survives.
-const EXPERIENCE_OUTPUT = `INSERTED.id, INSERTED.title, INSERTED.organization,
-  CONVERT(varchar(10), INSERTED.start_date, 23) AS start_date,
-  CONVERT(varchar(10), INSERTED.end_date, 23) AS end_date,
-  INSERTED.description, INSERTED.sort_order`;
-
-const EDUCATION_OUTPUT = `INSERTED.id, INSERTED.degree, INSERTED.institution,
-  INSERTED.field_of_study, INSERTED.start_year, INSERTED.end_year,
-  INSERTED.grade, INSERTED.sort_order`;
+               ORDER BY a.requested_at DESC LIMIT 1)`;
 
 // --- Statements -------------------------------------------------------------
 
-// An outer LIMIT with an ORDER BY already present, so OFFSET/FETCH applies
-// cleanly (it requires the ORDER BY that LIMIT does not).
-const Q_RECENT_LEARNING = sql({
-  pg: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
+const Q_RECENT_LEARNING = `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
      FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
      WHERE te.employee_id = $1
      ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
-     LIMIT 8`,
-  mssql: `SELECT tc.title, te.status, te.completed_at, te.progress_percent, tc.course_type
-     FROM training_enrollments te JOIN training_courses tc ON tc.id = te.course_id
-     WHERE te.employee_id = $1
-     ORDER BY COALESCE(te.completed_at, te.enrolled_at) DESC
-     OFFSET 0 ROWS FETCH NEXT 8 ROWS ONLY`,
-});
+     LIMIT 8`;
 
-const Q_REPARENT = sql({
-  pg: `UPDATE employees
+const Q_REPARENT = `UPDATE employees
           SET manager_id    = $2,
               org_title     = COALESCE($3, org_title),
               sibling_order = COALESCE($4,
                 COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
         WHERE id = $1
-        RETURNING id, full_name, manager_id, org_title, sibling_order`,
-  mssql: `DECLARE @out TABLE (
-            id UNIQUEIDENTIFIER, full_name NVARCHAR(450), manager_id UNIQUEIDENTIFIER,
-            org_title NVARCHAR(450), sibling_order INT);
-        UPDATE employees
-          SET manager_id    = $2,
-              org_title     = COALESCE($3, org_title),
-              sibling_order = COALESCE($4,
-                COALESCE((SELECT MAX(sibling_order) + 1 FROM employees WHERE manager_id = $2), 1))
-        OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.manager_id,
-               INSERTED.org_title, INSERTED.sibling_order
-          INTO @out
-        WHERE id = $1;
-        SELECT id, full_name, manager_id, org_title, sibling_order FROM @out;`,
-});
+        RETURNING id, full_name, manager_id, org_title, sibling_order`;
 
-// The only true UPSERT in the codebase, so the only place MERGE is warranted.
-//
-// WITH (HOLDLOCK) is required, not decorative: without it MERGE can raise a
-// duplicate-key error under concurrency, because the match test and the insert
-// are not serialised. This is the documented fix and it restores the atomicity
-// ON CONFLICT DO UPDATE has by construction.
-//
-// MERGE must be terminated by a semicolon.
-const Q_UPSERT_CV = sql({
-  pg: `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
+// The only true UPSERT in the codebase.
+const Q_UPSERT_CV = `INSERT INTO employee_cv (employee_id, headline, summary, phone, location_text, linkedin_url)
          VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (employee_id) DO UPDATE
            SET headline = EXCLUDED.headline,
@@ -323,153 +187,58 @@ const Q_UPSERT_CV = sql({
                location_text = EXCLUDED.location_text,
                linkedin_url = EXCLUDED.linkedin_url
          RETURNING employee_id, headline, summary, phone, location_text, linkedin_url,
-                   verification_status`,
-  mssql: `DECLARE @out TABLE (
-            employee_id UNIQUEIDENTIFIER, headline NVARCHAR(MAX), summary NVARCHAR(MAX),
-            phone NVARCHAR(450), location_text NVARCHAR(450), linkedin_url NVARCHAR(450),
-            verification_status NVARCHAR(450));
-          MERGE employee_cv WITH (HOLDLOCK) AS t
-          USING (SELECT $1 AS employee_id) AS s ON t.employee_id = s.employee_id
-          WHEN MATCHED THEN UPDATE
-            SET headline = $2, summary = $3, phone = $4,
-                location_text = $5, linkedin_url = $6
-          WHEN NOT MATCHED THEN
-            INSERT (employee_id, headline, summary, phone, location_text, linkedin_url)
-            VALUES ($1,$2,$3,$4,$5,$6)
-          OUTPUT INSERTED.employee_id, INSERTED.headline, INSERTED.summary, INSERTED.phone,
-                 INSERTED.location_text, INSERTED.linkedin_url, INSERTED.verification_status
-            INTO @out;
-          SELECT employee_id, headline, summary, phone, location_text, linkedin_url,
-                 verification_status FROM @out;`,
-});
+                   verification_status`;
 
-const Q_INSERT_EXPERIENCE = sql({
-  pg: `INSERT INTO employee_experience
+const Q_INSERT_EXPERIENCE = `INSERT INTO employee_experience
            (employee_id, title, organization, start_date, end_date, description, sort_order)
          VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))
-         RETURNING ${EXPERIENCE_COLUMNS}`,
-  mssql: `INSERT INTO employee_experience
-           (employee_id, title, organization, start_date, end_date, description, sort_order)
-         OUTPUT ${EXPERIENCE_OUTPUT}
-         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,0))`,
-});
+         RETURNING ${EXPERIENCE_COLUMNS}`;
 
-const Q_UPDATE_EXPERIENCE = sql({
-  pg: `UPDATE employee_experience
+const Q_UPDATE_EXPERIENCE = `UPDATE employee_experience
             SET title = $3, organization = $4, start_date = $5, end_date = $6,
                 description = $7, sort_order = COALESCE($8, sort_order)
           WHERE id = $1 AND employee_id = $2
-          RETURNING ${EXPERIENCE_COLUMNS}`,
-  mssql: `UPDATE employee_experience
-            SET title = $3, organization = $4, start_date = $5, end_date = $6,
-                description = $7, sort_order = COALESCE($8, sort_order)
-          OUTPUT ${EXPERIENCE_OUTPUT}
-          WHERE id = $1 AND employee_id = $2`,
-});
+          RETURNING ${EXPERIENCE_COLUMNS}`;
 
-const Q_INSERT_EDUCATION = sql({
-  pg: `INSERT INTO employee_education
+const Q_INSERT_EDUCATION = `INSERT INTO employee_education
            (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
          VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))
-         RETURNING ${EDUCATION_COLUMNS}`,
-  mssql: `INSERT INTO employee_education
-           (employee_id, degree, institution, field_of_study, start_year, end_year, grade, sort_order)
-         OUTPUT ${EDUCATION_OUTPUT}
-         VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0))`,
-});
+         RETURNING ${EDUCATION_COLUMNS}`;
 
-const Q_UPDATE_EDUCATION = sql({
-  pg: `UPDATE employee_education
+const Q_UPDATE_EDUCATION = `UPDATE employee_education
             SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
                 end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
           WHERE id = $1 AND employee_id = $2
-          RETURNING ${EDUCATION_COLUMNS}`,
-  mssql: `UPDATE employee_education
-            SET degree = $3, institution = $4, field_of_study = $5, start_year = $6,
-                end_year = $7, grade = $8, sort_order = COALESCE($9, sort_order)
-          OUTPUT ${EDUCATION_OUTPUT}
-          WHERE id = $1 AND employee_id = $2`,
-});
+          RETURNING ${EDUCATION_COLUMNS}`;
 
-// No ORDER BY here, so TOP rather than OFFSET/FETCH.
-const Q_FIND_SKILL_BY_NAME = sql({
-  pg: 'SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1',
-  mssql: 'SELECT TOP 1 id FROM skills WHERE name LIKE $1',
-});
+const Q_FIND_SKILL_BY_NAME = 'SELECT id FROM skills WHERE name ILIKE $1 LIMIT 1';
 
-const Q_INSERT_SKILL_MINIMAL = sql({
-  pg: `INSERT INTO skills (code, name, description, category_id)
+const Q_INSERT_SKILL_MINIMAL = `INSERT INTO skills (code, name, description, category_id)
              VALUES ($1, $2, 'Added from an employee profile', $3)
-             RETURNING id`,
-  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER);
-           INSERT INTO skills (code, name, description, category_id)
-             OUTPUT INSERTED.id INTO @out
-             VALUES ($1, $2, 'Added from an employee profile', $3);
-           SELECT id FROM @out;`,
-});
+             RETURNING id`;
 
-const Q_ASSIGN_SKILL = sql({
-  pg: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
+const Q_ASSIGN_SKILL = `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
          VALUES ($1,$2,$3)
-         ON CONFLICT (employee_id, skill_id) DO NOTHING`,
-  mssql: `INSERT INTO employee_skill_assignments (employee_id, skill_id, assigned_by_employee_id)
-         SELECT $1,$2,$3 WHERE NOT EXISTS (
-           SELECT 1 FROM employee_skill_assignments WITH (UPDLOCK, HOLDLOCK)
-            WHERE employee_id = $1 AND skill_id = $2)`,
-});
+         ON CONFLICT (employee_id, skill_id) DO NOTHING`;
 
-const Q_HAS_OTHER_ASSESSMENT = sql({
-  pg: `SELECT 1 FROM skill_assessments
+const Q_HAS_OTHER_ASSESSMENT = `SELECT 1 FROM skill_assessments
           WHERE employee_id = $1 AND skill_id = $2
             AND assessor_type IN ('Manager','Mentor','SME')
-          LIMIT 1`,
-  mssql: `SELECT TOP 1 1 FROM skill_assessments
-          WHERE employee_id = $1 AND skill_id = $2
-            AND assessor_type IN ('Manager','Mentor','SME')`,
-});
+          LIMIT 1`;
 
 // Direct reports — the DOWN side of the record, always full-record visible
 // because anyone you can see has a subtree contained in your own.
-//
-// Postgres selects EXISTS(...) directly, since it is a boolean expression there.
-// T-SQL has no boolean expression type — EXISTS is only ever a predicate — so
-// the projection needs a CASE, cast to bit so the driver still returns a real
-// JS boolean and the API response shape is unchanged.
-const Q_DIRECT_REPORTS = sql({
-  pg: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
+const Q_DIRECT_REPORTS = `SELECT e.id, e.full_name, e.org_title, e.photo_url,
             jr.role_name AS job_role,
             EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id) AS has_reports
      FROM employees e
      LEFT JOIN job_roles jr ON jr.id = e.job_role_id
      WHERE e.manager_id = $1
-     ORDER BY e.sibling_order, e.full_name`,
-  mssql: `SELECT e.id, e.full_name, e.org_title, e.photo_url,
-            jr.role_name AS job_role,
-            CAST(CASE WHEN EXISTS (SELECT 1 FROM employees c WHERE c.manager_id = e.id)
-                      THEN 1 ELSE 0 END AS bit) AS has_reports
-     FROM employees e
-     LEFT JOIN job_roles jr ON jr.id = e.job_role_id
-     WHERE e.manager_id = $1
-     ORDER BY e.sibling_order, e.full_name`,
-});
+     ORDER BY e.sibling_order, e.full_name`;
 
-const Q_SET_PHOTO = sql({
-  pg: 'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url',
-  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
-          UPDATE employees SET photo_url = $2
-          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
-          WHERE id = $1;
-          SELECT id, photo_url FROM @out;`,
-});
+const Q_SET_PHOTO = 'UPDATE employees SET photo_url = $2 WHERE id = $1 RETURNING id, photo_url';
 
-const Q_CLEAR_PHOTO = sql({
-  pg: 'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url',
-  mssql: `DECLARE @out TABLE (id UNIQUEIDENTIFIER, photo_url NVARCHAR(450));
-          UPDATE employees SET photo_url = NULL
-          OUTPUT INSERTED.id, INSERTED.photo_url INTO @out
-          WHERE id = $1;
-          SELECT id, photo_url FROM @out;`,
-});
+const Q_CLEAR_PHOTO = 'UPDATE employees SET photo_url = NULL WHERE id = $1 RETURNING id, photo_url';
 
 // Make sure the 1:1 CV row exists before updating it.
 function ensureCv(client, employeeId) {
@@ -495,13 +264,9 @@ async function resetVerification(client, employeeId) {
 
 // Whole-history counts for the Learning Module stat row.
 //
-// pg's count(*) is bigint and would arrive as a string, hence ::int; T-SQL's
-// COUNT(*) is already int, so the mssql branch just drops the cast. The hours
-// sum is cast on both sides for the same reason the averages in routes/skills.js
-// are: duration_hours is NUMERIC, which pg returns as a string and T-SQL as a
-// decimal, and the client wants a number.
-const Q_LEARNING_STATS = sql({
-  pg: `SELECT
+// count(*) is bigint and would arrive as a string, hence ::int. duration_hours
+// is NUMERIC, which also arrives as a string, hence ::float.
+const Q_LEARNING_STATS = `SELECT
        (SELECT count(*)::int FROM training_enrollments te
          WHERE te.employee_id = $1 AND te.status = 'Completed')             AS courses_completed,
        (SELECT count(*)::int FROM training_enrollments te
@@ -510,37 +275,13 @@ const Q_LEARNING_STATS = sql({
        (SELECT COALESCE(sum(tc.duration_hours), 0)::float
           FROM training_enrollments te
           JOIN training_courses tc ON tc.id = te.course_id
-         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`,
-  mssql: `SELECT
-       (SELECT count(*) FROM training_enrollments te
-         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS courses_completed,
-       (SELECT count(*) FROM training_enrollments te
-         WHERE te.employee_id = $1
-           AND te.status IN ('Nominated','Approved','In Progress'))         AS courses_in_progress,
-       (SELECT CAST(COALESCE(sum(tc.duration_hours), 0) AS float)
-          FROM training_enrollments te
-          JOIN training_courses tc ON tc.id = te.course_id
-         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`,
-});
+         WHERE te.employee_id = $1 AND te.status = 'Completed')             AS course_hours`;
 
 // Courses still running, each with its module list and which modules are done.
 //
-// Same JSON split as LABELS_JSON in routes/skills.js: pg builds the array with
-// json_agg, T-SQL with a correlated FOR JSON PATH. The two return different JS
-// types - an array from pg, a string from mssql - which parseModules() below
-// reconciles, so the response body is identical either way.
-//
-// INCLUDE_NULL_VALUES matters: FOR JSON PATH omits null keys by default, and the
-// client reads `completed_at == null` to mean "module not ticked". Without it an
-// unticked module would arrive with no completed_at key at all on mssql and a
-// null one on pg - the same value, but only one of them survives a `'completed_at'
-// in module` style check, and the shapes would no longer be identical.
-//
-// LIMIT 12 -> TOP 12. Safe to relocate here because it applies to the OUTER
-// statement, which has its own ORDER BY; the rewriter refuses to move a LIMIT
-// only because it cannot tell that case from a correlated subquery's.
-const Q_ACTIVE_ENROLLMENTS = sql({
-  pg: `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
+// The client reads `completed_at == null` to mean "module not ticked", so the
+// key has to be present on every module — json_build_object keeps nulls.
+const Q_ACTIVE_ENROLLMENTS = `SELECT te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
             tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
             COALESCE((
               SELECT json_agg(json_build_object(
@@ -560,68 +301,15 @@ const Q_ACTIVE_ENROLLMENTS = sql({
      WHERE te.employee_id = $1
        AND te.status IN ('Nominated','Approved','In Progress')
      ORDER BY te.enrolled_at DESC
-     LIMIT 12`,
-  mssql: `SELECT TOP 12
-            te.id, te.course_id, te.status, te.progress_percent, te.enrolled_at,
-            tc.title, tc.course_type, tc.delivery_mode, tc.duration_hours, tc.difficulty,
-            COALESCE((
-              SELECT cm.id                AS id,
-                     cm.module_order      AS module_order,
-                     cm.module_title      AS module_title,
-                     cm.duration_minutes  AS duration_minutes,
-                     emp.completed_at     AS completed_at
-              FROM course_modules cm
-              LEFT JOIN enrollment_module_progress emp
-                     ON emp.module_id = cm.id AND emp.enrollment_id = te.id
-              WHERE cm.course_id = tc.id
-              ORDER BY cm.module_order
-              FOR JSON PATH, INCLUDE_NULL_VALUES
-            ), '[]') AS modules
-     FROM training_enrollments te
-     JOIN training_courses tc ON tc.id = te.course_id
-     WHERE te.employee_id = $1
-       AND te.status IN ('Nominated','Approved','In Progress')
-     ORDER BY te.enrolled_at DESC`,
-});
-
-// Turns the `modules` column into an array whichever dialect produced it: pg's
-// json_agg is parsed by the driver already, FOR JSON PATH arrives as a string,
-// and both return nothing at all when the course has no modules.
-//
-// Same job as parseJsonColumn() in routes/skills.js, kept local for the same
-// reason that one is - one caller, and the fallback differs per column.
-function parseModules(rows) {
-  for (const row of rows) {
-    const v = row.modules;
-    if (Array.isArray(v)) continue;
-    if (typeof v === 'string' && v.length > 0) {
-      try {
-        const parsed = JSON.parse(v);
-        row.modules = Array.isArray(parsed) ? parsed : [];
-        continue;
-      } catch {
-        // fall through to the empty list
-      }
-    }
-    row.modules = [];
-  }
-  return rows;
-}
+     LIMIT 12`;
 
 // The learning journey: one chronology out of four tables. Every branch produces
 // the same six columns so the UNION types line up; the first branch fixes them.
 //
 // A "level up" is an assessment that beats every earlier one for that skill - a
 // running max over the preceding rows - so a manager re-confirming L3 after L3
-// is not an event, and the very first rating is. The window frame is identical
-// on both dialects; T-SQL has supported it since 2012.
-//
-// What diverges is only the scalar plumbing: `::` casts become CAST(), the `||`
-// concatenations become CONCAT() (T-SQL's `+` propagates NULL, CONCAT does not,
-// which is the behaviour the pg side relies on inside concat_ws), to_char
-// becomes FORMAT, and the outer LIMIT becomes TOP.
-const Q_LEARNING_TIMELINE = sql({
-  pg: `WITH level_ups AS (
+// is not an event, and the very first rating is.
+const Q_LEARNING_TIMELINE = `WITH level_ups AS (
        SELECT s.name AS skill_name, sa.assessed_level, sa.assessor_type, sa.assessed_at,
               MAX(sa.assessed_level) OVER (
                 PARTITION BY sa.skill_id ORDER BY sa.assessed_at
@@ -688,75 +376,7 @@ const Q_LEARNING_TIMELINE = sql({
        WHERE ma.mentee_id = $1
      ) events
      ORDER BY event_at DESC
-     LIMIT 40`,
-  mssql: `WITH level_ups AS (
-       SELECT s.name AS skill_name, sa.assessed_level, sa.assessor_type, sa.assessed_at,
-              MAX(sa.assessed_level) OVER (
-                PARTITION BY sa.skill_id ORDER BY sa.assessed_at
-                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-              ) AS previous_best
-       FROM skill_assessments sa
-       JOIN skills s ON s.id = sa.skill_id
-       WHERE sa.employee_id = $1 AND sa.status IN ('Submitted','Approved')
-     )
-     SELECT TOP 40 * FROM (
-       SELECT CAST('course' AS NVARCHAR(450)) AS kind,
-              te.completed_at AS event_at,
-              tc.title AS title,
-              tc.course_type AS detail,
-              NULLIF(CONCAT_WS(' · ',
-                tc.delivery_mode,
-                CASE WHEN tc.duration_hours IS NOT NULL THEN CONCAT(tc.duration_hours, ' hrs') END,
-                CASE WHEN te.score IS NOT NULL THEN CONCAT('Score ', te.score) END), '') AS meta,
-              CAST(NULL AS int) AS level
-       FROM training_enrollments te
-       JOIN training_courses tc ON tc.id = te.course_id
-       WHERE te.employee_id = $1 AND te.status = 'Completed' AND te.completed_at IS NOT NULL
-
-       UNION ALL
-
-       SELECT CAST('certification' AS NVARCHAR(450)),
-              CAST(ec.issued_date AS DATETIMEOFFSET),
-              COALESCE(c.title, ec.title_text),
-              COALESCE(ec.issuer, c.certification_type, 'Certification'),
-              NULLIF(CONCAT_WS(' · ',
-                ec.institution,
-                CASE WHEN ec.expiry_date IS NOT NULL
-                     THEN CONCAT('Valid to ', FORMAT(ec.expiry_date, 'dd MMM yyyy')) END,
-                CASE WHEN ec.source = 'Self' THEN 'Self-reported' ELSE ec.status END), ''),
-              CAST(NULL AS int)
-       FROM employee_certifications ec
-       LEFT JOIN certifications c ON c.id = ec.certification_id
-       WHERE ec.employee_id = $1 AND ec.issued_date IS NOT NULL
-
-       UNION ALL
-
-       SELECT CAST('skill' AS NVARCHAR(450)),
-              lu.assessed_at,
-              lu.skill_name,
-              CASE WHEN lu.previous_best IS NULL
-                   THEN CONCAT('First rating · L', lu.assessed_level)
-                   ELSE CONCAT('L', lu.previous_best, ' → L', lu.assessed_level) END,
-              CONCAT(lu.assessor_type, ' assessment'),
-              lu.assessed_level
-       FROM level_ups lu
-       WHERE lu.previous_best IS NULL OR lu.assessed_level > lu.previous_best
-
-       UNION ALL
-
-       SELECT CAST('mentoring' AS NVARCHAR(450)),
-              ms.session_date,
-              ms.topic,
-              COALESCE(ms.mode, 'Session'),
-              mtr.full_name,
-              CAST(NULL AS int)
-       FROM mentoring_sessions ms
-       JOIN mentor_assignments ma ON ma.id = ms.mentor_assignment_id
-       JOIN employees mtr ON mtr.id = ma.mentor_id
-       WHERE ma.mentee_id = $1
-     ) events
-     ORDER BY event_at DESC`,
-});
+     LIMIT 40`;
 
 // One projection for certifications, used by the profile payload AND re-read
 // after every write: RETURNING cannot reach the joined catalogue title or the
@@ -768,11 +388,8 @@ const Q_LEARNING_TIMELINE = sql({
 //
 // Dates go out as 'YYYY-MM-DD' strings for the same reason EXPERIENCE_COLUMNS
 // does it — they land straight in an <input type="date">, and a Date round-trip
-// through JSON shifts the day across a timezone. Same per-dialect split as
-// EXPERIENCE_COLUMNS: to_char has no T-SQL token equivalent, CONVERT style 23
-// is the ISO yyyy-mm-dd form.
-const CERTIFICATION_SELECT = sql({
-  pg: `
+// through JSON shifts the day across a timezone.
+const CERTIFICATION_SELECT = `
   SELECT ec.id, ec.certification_id, ec.source, ec.status,
          COALESCE(c.title, ec.title_text) AS title,
          ec.title_text, ec.issuer, ec.technology, ec.institution,
@@ -784,41 +401,16 @@ const CERTIFICATION_SELECT = sql({
          appr.full_name AS approved_by
     FROM employee_certifications ec
     LEFT JOIN certifications c ON c.id = ec.certification_id
-    LEFT JOIN employees appr   ON appr.id = ec.approved_by`,
-  mssql: `
-  SELECT ec.id, ec.certification_id, ec.source, ec.status,
-         COALESCE(c.title, ec.title_text) AS title,
-         ec.title_text, ec.issuer, ec.technology, ec.institution,
-         ec.credential_id, ec.credential_url, ec.hours, ec.notes,
-         CONVERT(varchar(10), ec.issued_date, 23) AS issued_date,
-         CONVERT(varchar(10), ec.expiry_date, 23) AS expiry_date,
-         ec.evidence_file_url,
-         c.certification_type, c.validity_months,
-         appr.full_name AS approved_by
-    FROM employee_certifications ec
-    LEFT JOIN certifications c ON c.id = ec.certification_id
-    LEFT JOIN employees appr   ON appr.id = ec.approved_by`,
-});
+    LEFT JOIN employees appr   ON appr.id = ec.approved_by`;
 
-// employee_certifications carries no updated_at trigger on either dialect, so
-// the mssql branch can OUTPUT straight to the caller rather than going through a
-// table variable the way Q_INSERT_EMPLOYEE has to.
-//
 // Only the id comes back: the row the client gets is re-read through
-// CERTIFICATION_SELECT, which OUTPUT could not produce anyway - it reaches the
-// joined catalogue title and the approver's name.
-const Q_INSERT_CERTIFICATION = sql({
-  pg: `INSERT INTO employee_certifications
+// CERTIFICATION_SELECT, which RETURNING could not produce anyway — it reaches
+// the joined catalogue title and the approver's name.
+const Q_INSERT_CERTIFICATION = `INSERT INTO employee_certifications
            (employee_id, source, status, certification_id, title_text, issuer, technology,
             institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
          VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         RETURNING id`,
-  mssql: `INSERT INTO employee_certifications
-           (employee_id, source, status, certification_id, title_text, issuer, technology,
-            institution, issued_date, expiry_date, credential_id, credential_url, hours, notes)
-         OUTPUT INSERTED.id
-         VALUES ($1,'Self','Self-Reported',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-});
+         RETURNING id`;
 
 function selectCertification(client, certId) {
   return client
@@ -1381,7 +973,7 @@ async function loadProfile(id) {
       courses_in_progress: 0,
       course_hours: 0,
     },
-    enrollments: parseModules(enrollments.rows),
+    enrollments: enrollments.rows,
     learningTimeline: timeline.rows,
     mentorNotes: mentorNotes.rows,
     directReports: reports.rows,
@@ -1474,7 +1066,7 @@ router.patch('/:id/manager', requireRole(...MANAGE_ROLES), requireVisible(), asy
   } catch (err) {
     // The cycle trigger raises check_violation; surface it as a conflict rather
     // than a 500, since it is a legitimate thing for a caller to attempt. The
-    // two dialects signal it differently, so the test goes through db/errors.js.
+    // the predicate lives in db/errors.js so the message regex has one home.
     if (isReportingCycle(err)) {
       return res
         .status(409)

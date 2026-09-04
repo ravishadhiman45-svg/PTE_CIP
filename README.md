@@ -1,19 +1,28 @@
 # PTE CIP — Powertrain Engineering Capability Intelligence Platform
 
 A full-stack skills/capability management platform for a powertrain engineering
-organization. Dark-navy SaaS UI, role-based access, and a Supabase-hosted
-PostgreSQL database.
+organization. Dark-navy SaaS UI, role-based access, and a PostgreSQL database.
 
 - **Frontend:** Next.js 14 (App Router, JSX), Tailwind CSS, Recharts, lucide-react, SWR
 - **Backend:** Node.js + Express REST API using `pg` (parameterized SQL, no ORM)
-- **Database:** Supabase-hosted PostgreSQL (schema + seed provided)
+- **Database:** PostgreSQL. One schema, one dialect, two places it can run:
+
+| `PG_DRIVER` | Where Postgres runs | For |
+| --- | --- | --- |
+| `server` | Supabase, or any Postgres over TCP | the online deployment |
+| `pglite` | in this process, against `server/.pgdata` | the offline/local deployment |
+
+`pglite` is PostgreSQL itself, compiled to WebAssembly. It needs no database
+server, no service, no credentials and no admin rights — which is what makes the
+whole application runnable on a locked-down laptop. Both drivers load the same
+`db/pg/*.sql` and run the same application SQL, so there is no second schema and
+no query translation anywhere in the codebase.
 
 ```
 ptecip/
 ├── client/     # Next.js app (JSX + Tailwind)
 ├── server/     # Express API
-├── db/         # 01_schema.sql, 02_seed.sql, 03_demo_queries.sql, 04_mermaid_erd.md,
-│              # 05_profile_cv.sql
+├── db/pg/      # the schema: 01_schema.sql … 15_sample_course.sql
 └── README.md
 ```
 
@@ -21,18 +30,14 @@ ptecip/
 
 ## 1. Set up the database
 
-The server runs against **either** PostgreSQL or **Microsoft SQL Server**,
-selected by `DB_DIALECT`. The SQL lives in two parallel trees — see
-[`db/README.md`](db/README.md) for the load order, the type mapping, and the
-places the two dialects genuinely differ.
+All SQL lives in [`db/pg/`](db/pg/) — see [`db/README.md`](db/README.md) for the
+load order.
 
-- **PostgreSQL / Supabase** — the steps below.
-- **Microsoft SQL Server 2019/2022** (on-premise) — run `db/mssql/01_schema.sql`,
-  `07_org_hierarchy.sql` and `09_scoped_analytics.sql` with a tool that treats
-  `GO` as a batch separator (`sqlcmd`, SSMS, Azure Data Studio), then transfer the
-  data from a populated Postgres instance. Seed data is not re-authored as T-SQL.
+**Offline (`PG_DRIVER=pglite`) needs no setup at all.** Skip this whole section:
+the first `npm run dev` creates `server/.pgdata` and applies every file in
+`db/pg/` into it, seed data included.
 
-### PostgreSQL (Supabase)
+### Supabase (`PG_DRIVER=server`)
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. Open **SQL Editor** and run, in order:
@@ -75,18 +80,24 @@ npm run dev               # http://localhost:4000
 
 | Variable | Description |
 | --- | --- |
-| `DB_DIALECT` | **Required.** `postgres` or `mssql`. Never inferred from the connection string — a wrong guess gives a working connection running the wrong SQL. |
+| `DB_DIALECT` | `postgres`. The only supported value; kept so a deployment states it rather than having it inferred. |
+| `PG_DRIVER` | `server` (default) or `pglite`. Chooses **where** Postgres runs, not which SQL is used. |
 | `JWT_SECRET` | Signing key for the app's JWTs. **Required in production**; the server refuses to start without it rather than falling back to a known constant. |
 | `SHARED_LOGIN_PASSWORD` | The one shared employee password. (Earlier docs called this `DEMO_PASSWORD`; the code has always read `SHARED_LOGIN_PASSWORD`.) |
 | `GOOGLE_CLIENT_ID` | For `POST /api/auth/google`. Optional. |
 | `PORT` / `CLIENT_ORIGIN` | API port, and the CORS origin for the client. Set `CLIENT_ORIGIN` on deploy — the localhost default silently blocks a deployed frontend. |
 
-**When `DB_DIALECT=postgres`:** `DATABASE_URL` (Supabase Transaction pooler), and
+**When `PG_DRIVER=server`:** `DATABASE_URL` (Supabase Transaction pooler), and
 `PGSSL=disable` for a local server with no TLS.
 
-**When `DB_DIALECT=mssql`:** `MSSQL_SERVER` + `MSSQL_DATABASE` (plus
-`MSSQL_PORT`, `MSSQL_USER`, `MSSQL_PASSWORD`, `MSSQL_INSTANCE` as needed), or a
-single `MSSQL_CONNECTION_STRING`.
+**When `PG_DRIVER=pglite`:** nothing is required. `PGLITE_DATA_DIR` overrides the
+default `server/.pgdata`; a relative path resolves against `server/`, not the
+working directory. `memory://` gives a throwaway instance (the test suite uses
+it). The first start applies `db/pg/*.sql` and records each file in
+`_pglite_migrations`, so a restart reloads nothing.
+
+> **The `.pgdata` directory is the database.** Back it up alongside
+> `server/uploads/`. Deleting it resets the application to seed data.
 
 **Profile pictures** — `STORAGE_DRIVER` is `localDisk` (default) or `supabase`:
 
@@ -106,16 +117,24 @@ node tools/migrate-photo-urls.js --download --apply
 ```
 
 Health check: `GET http://localhost:4000/api/health` — reports the resolved
-dialect and storage driver, so a deployment is verifiable without shell access.
+driver and storage driver, so a deployment is verifiable without shell access:
+
+```json
+{ "ok": true, "service": "ptecip-api", "dialect": "postgres",
+  "driver": "pglite", "storage": "localDisk" }
+```
 
 ### Checks
 
 ```bash
 cd server
-npm run lint:sql   # SQL that would not run on both dialects
-npm test           # 111 tests, no external services needed
-npm run check      # both
+npm test    # 134 tests, no external services needed
 ```
+
+`test/pglite.test.js` loads the whole of `db/pg/` into a `memory://` instance and
+pins the value shapes against what `pg` returns; `test/pglite-api.test.js` spawns
+the real server on a temporary `.pgdata`, exercises the API over HTTP, then
+restarts it to prove the data persisted.
 
 ---
 
@@ -143,7 +162,8 @@ any signed-in user could read anyone's full record; it no longer is.
   plus add/edit/remove **experience** and **education** rows. Everything is typed
   in by hand; there is no CV file upload.
 - **Profile picture** — the only real file upload. Goes to the Supabase Storage
-  bucket; the public URL is saved on `employees.photo_url`.
+  bucket, or to `server/uploads/` on the offline install (`STORAGE_DRIVER`); the
+  public URL is saved on `employees.photo_url` either way.
 - **Add Skill** — search the skill library or type a skill that doesn't exist yet
   (it gets created), then set your own level 1–5. Stored as an
   `employee_skill_assignments` link plus a `Self` row in `skill_assessments`, so
@@ -184,8 +204,8 @@ the same rules as the form — it is the same `insertEmployee` underneath.
   guaranteed to waste the reader's time.
 - A `dropWhenEmpty` lookup column (Department, Team, Job Role, Location) is
   **left out of the template entirely** when its table has no rows, which is the
-  state of a database built from `db/mssql/` — only `db/pg/02_seed.sql` ever
-  populated them. There is no value the writer could put in an empty dropdown
+  state of a schema loaded without `db/pg/02_seed.sql`. There is no value the
+  writer could put in an empty dropdown
   that would be accepted, so shipping the column can only produce a rejected
   upload. It reappears on its own once the first row exists, and the parser
   still knows the column, so a sheet downloaded earlier keeps importing.

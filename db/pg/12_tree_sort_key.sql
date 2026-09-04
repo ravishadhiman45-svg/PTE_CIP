@@ -10,21 +10,16 @@
 --   ORDER BY string_to_array(t.structural_code, '.')::int[]
 --
 -- which sorts "2.10" after "2.9" by comparing the segments as integers rather
--- than as text. Correct, but string_to_array and the array cast have no T-SQL
--- equivalent, so it was the one ordering in the codebase that would have needed
--- a per-dialect branch.
+-- than as text. Correct, but it made every caller re-parse the display code to
+-- order by it, and pushed an array cast into the ORDER BY of every org query.
 --
 -- A zero-padded key sorts identically as PLAIN TEXT — "0002.0009." precedes
--- "0002.0010." — so exposing it from the view makes `ORDER BY t.sort_key`
--- correct on both dialects. The ordering became dialect-NEUTRAL instead of
--- dialect-specific, which is a better outcome than a dual constant.
+-- "0002.0010." — so exposing it from the view reduces the whole thing to
+-- `ORDER BY t.sort_key`.
 --
 -- Four digits per level supports 9999 direct reports; the widest branch here is
 -- single digits. structural_code is unchanged and still the human-facing form
 -- ("2.1.3"); sort_key exists only to be ordered by.
---
--- Keep in step with db/mssql/07_org_hierarchy.sql, which builds the same column
--- with RIGHT('0000' + ..., 4).
 -- =============================================================
 
 DROP VIEW IF EXISTS v_employee_tree;

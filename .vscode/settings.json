@@ -1,14 +1,14 @@
 {
-  // The files in db/ are PostgreSQL, but the MSSQL extension claims *.sql and
-  // parses them as T-SQL — so valid Postgres gets flagged as a syntax error.
+  // The files in db/pg/ are PostgreSQL, but the MSSQL extension claims *.sql
+  // and parses them as T-SQL — so valid Postgres is flagged as a syntax error.
   // The ones it reports loudest:
   //   DROP TRIGGER <name> ON <table>   -> "Expecting ALL, or DATABASE"
   //                                       (T-SQL only allows ON ALL SERVER / ON DATABASE)
   //   ON DELETE CASCADE, TIMESTAMPTZ, gen_random_uuid(), $$ ... $$ bodies,
   //   CREATE INDEX IF NOT EXISTS, EXECUTE FUNCTION
   //
-  // None of these are real: every file in db/ has been run against the live
-  // database, twice each, with no error. Turning off the T-SQL error checker
-  // stops the false positives; syntax highlighting is unaffected.
+  // None of these are real: every file in db/pg/ runs against both the live
+  // Supabase database and a PGlite instance. Turning off the T-SQL error
+  // checker stops the false positives; syntax highlighting is unaffected.
   "mssql.intelliSense.enableErrorChecking": false
 }

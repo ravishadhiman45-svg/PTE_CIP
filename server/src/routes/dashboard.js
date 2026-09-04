@@ -6,21 +6,14 @@
 // about exactly one person — themselves. That falls out of the same predicate
 // the rest of the API uses rather than being a separate set of rules.
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { visibleIdsSql, isAdmin } = require('../lib/visibility');
 
 const router = express.Router();
 
-// GREATEST() only arrived in SQL Server 2022, and the target is stated as
-// 2019/2022 — so it has to be a CASE expression rather than a token swap.
-const AVG_GAP = sql({
-  pg: 'ROUND(AVG(GREATEST(COALESCE(b.required_level,0) - COALESCE(m.effective_level,0), 0)), 2)',
-  mssql: `ROUND(AVG(CAST(
-                CASE WHEN COALESCE(b.required_level,0) - COALESCE(m.effective_level,0) > 0
-                     THEN COALESCE(b.required_level,0) - COALESCE(m.effective_level,0)
-                     ELSE 0 END AS decimal(10,2))), 2)`,
-});
-
+// Average shortfall against the benchmark, floored at zero so someone ahead of
+// their required level does not offset a colleague who is behind.
+const AVG_GAP = 'ROUND(AVG(GREATEST(COALESCE(b.required_level,0) - COALESCE(m.effective_level,0), 0)), 2)';
 
 // GET /api/dashboard/executive
 router.get('/executive', async (req, res, next) => {

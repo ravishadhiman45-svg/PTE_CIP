@@ -1,23 +1,15 @@
 // Mentor dashboard + mentee list.
 const express = require('express');
-const { query, sql } = require('../db');
+const { query } = require('../db');
 const { requireVisible } = require('../middleware/auth');
 const { visibleIdsSql } = require('../lib/visibility');
 
 const router = express.Router();
 
-// LIMIT 1 inside a CORRELATED SCALAR SUBQUERY — exactly the shape the rewriter
-// refuses to translate, because relocating the token to TOP would attach it to
-// the wrong SELECT. Written out per dialect instead.
-const LATEST_RECOMMENDATION = sql({
-  pg: `(SELECT recommended_level FROM mentor_recommendations mr
+// The mentor's most recent recommended level for this mentee.
+const LATEST_RECOMMENDATION = `(SELECT recommended_level FROM mentor_recommendations mr
                  WHERE mr.mentor_id = ma.mentor_id AND mr.employee_id = ma.mentee_id
-                 ORDER BY mr.submitted_at DESC LIMIT 1)`,
-  mssql: `(SELECT TOP 1 recommended_level FROM mentor_recommendations mr
-                 WHERE mr.mentor_id = ma.mentor_id AND mr.employee_id = ma.mentee_id
-                 ORDER BY mr.submitted_at DESC)`,
-});
-
+                 ORDER BY mr.submitted_at DESC LIMIT 1)`;
 
 // GET /api/mentor/:mentorId/dashboard
 //
