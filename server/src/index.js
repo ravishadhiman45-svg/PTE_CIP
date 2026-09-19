@@ -16,6 +16,7 @@ const employeesRoutes = require('./routes/employees');
 const trainingRoutes = require('./routes/training');
 const learningPlanRoutes = require('./routes/learningPlan');
 const learningModuleRoutes = require('./routes/learningModule');
+const learningModuleDynamicRoutes = require('./routes/learningModuleDynamic');
 const mentorRoutes = require('./routes/mentor');
 const certificationsRoutes = require('./routes/certifications');
 const roadmapRoutes = require('./routes/roadmap');
@@ -23,12 +24,24 @@ const inboxRoutes = require('./routes/inbox');
 const verificationRoutes = require('./routes/verification');
 const courseDevRoutes = require('./routes/courseDevelopment');
 const adminRoutes = require('./routes/admin');
+const adminCoursesRoutes = require('./routes/adminCourses');
 
 const app = express();
 
 app.use(
   cors({
-    origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000',
+    origin(origin, callback) {
+      const configured = process.env.CLIENT_ORIGIN || 'http://localhost:3000';
+      const localOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+
+      // Browsers send no Origin for same-origin/non-browser requests. During
+      // local development accept both common loopback names; deployments keep
+      // the explicitly configured origin only.
+      if (!origin || origin === configured || (process.env.NODE_ENV !== 'production' && localOrigins.includes(origin))) {
+        return callback(null, true);
+      }
+      return callback(new Error('Origin not allowed by API CORS policy'));
+    },
     // CORS hides every response header except a short safelist. The CV download
     // reads the filename the server chose out of Content-Disposition, so that
     // one has to be published explicitly.
@@ -83,6 +96,7 @@ app.use('/api/employees', employeesRoutes);
 app.use('/api/training', trainingRoutes);
 app.use('/api/learning-plan', learningPlanRoutes);
 app.use('/api/learning-module', learningModuleRoutes);
+app.use('/api/learning-module/dynamic', learningModuleDynamicRoutes);
 app.use('/api/mentor', mentorRoutes);
 app.use('/api/certifications', certificationsRoutes);
 app.use('/api/roadmap', roadmapRoutes);
@@ -90,6 +104,7 @@ app.use('/api/inbox', inboxRoutes);
 app.use('/api/verification', verificationRoutes);
 app.use('/api/course-development', courseDevRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin/courses', adminCoursesRoutes);
 
 // 404 for unknown API routes.
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

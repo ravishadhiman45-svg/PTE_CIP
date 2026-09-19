@@ -1,4 +1,10 @@
-node_modules/
+server/.pgdata/
+server/uploads/
+server/.env
+server/node_modules/
+client/node_modules/
+client/.next/
+client/.env.local
 .env
 .env.local
 .next/

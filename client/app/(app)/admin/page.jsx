@@ -17,8 +17,9 @@ import {
 import { fetcher } from '@/lib/api';
 import { PageHeader, Card, Skeleton, ErrorState, Badge } from '@/components/ui';
 import { formatDate } from '@/lib/ui';
+import Link from 'next/link';
 
-const TABS = ['Users', 'Roles & Permissions', 'Skill Taxonomy', 'Workflows', 'Integrations', 'Audit Logs'];
+const TABS = ['Users', 'Roles & Permissions', 'Skill Taxonomy', 'Learning', 'Workflows', 'Integrations', 'Audit Logs'];
 
 const SETTING_CARDS = [
   { icon: Users, title: 'User Management', desc: 'Add, edit and manage platform users' },
@@ -57,6 +58,7 @@ export default function AdminPage() {
       {tab === 'Users' ? <UsersTab /> : null}
       {tab === 'Audit Logs' ? <AuditLogsTab /> : null}
       {tab === 'Roles & Permissions' ? <RolesTab /> : null}
+      {tab === 'Learning' ? <LearningTab /> : null}
       {['Skill Taxonomy', 'Workflows', 'Integrations'].includes(tab) ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {SETTING_CARDS.map((c) => {
@@ -176,5 +178,26 @@ function RolesTab() {
         </Card>
       ))}
     </div>
+  );
+}
+
+function LearningTab() {
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-base font-semibold text-white">Learning Course Management</h3>
+          <p className="mt-1 text-sm text-slate-400">
+            Create and manage courses with dynamic content that automatically appear in the Learning Module
+          </p>
+        </div>
+        <Link href="/admin/learning">
+          <button className="btn-primary shrink-0">
+            <GraduationCap size={16} />
+            Manage Courses
+          </button>
+        </Link>
+      </div>
+    </Card>
   );
 }

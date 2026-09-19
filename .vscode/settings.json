@@ -7,8 +7,13 @@
   //   ON DELETE CASCADE, TIMESTAMPTZ, gen_random_uuid(), $$ ... $$ bodies,
   //   CREATE INDEX IF NOT EXISTS, EXECUTE FUNCTION
   //
-  // None of these are real: every file in db/pg/ runs against both the live
-  // Supabase database and a PGlite instance. Turning off the T-SQL error
-  // checker stops the false positives; syntax highlighting is unaffected.
-  "mssql.intelliSense.enableErrorChecking": false
+  // None of these are real: every file in db/pg/ runs against Supabase and
+  // PGlite. Turning off the T-SQL error checker
+  // stops the false positives; syntax highlighting is unaffected.
+  "mssql.intelliSense.enableErrorChecking": false,
+  "files.associations": {
+    "db/pg/**/*.sql": "pgsql",
+    "db/mssql/**/*.sql": "sql"
+  },
+  "chat.disableAIFeatures": false
 }
